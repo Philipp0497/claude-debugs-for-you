@@ -88,11 +88,14 @@ const server = new Server(
 );
 
 
-const debugDescription = `Execute a debug plan with breakpoints, launch, continues, and expression 
-evaluation. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track of where 
-you are, if paused on a breakpoint. Make sure to find and get the contents of any requested files. 
-Only use continue when ready to move to the next breakpoint. Launch will bring you to the first 
-breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.`;
+const debugDescription = `Execute a debug plan with breakpoints, launch, continues, stepping, and
+expression evaluation. Step types: setBreakpoint, removeBreakpoint, launch, continue, stepOver, stepInto,
+stepOut, pause, evaluate. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track
+of where you are, if paused on a breakpoint. Make sure to find and get the contents of any requested
+files. Only use continue when ready to move to the next breakpoint. Launch will bring you to the first
+breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT. stepOver/stepInto/stepOut advance one
+line/into/out while paused and pause halts a running target; these drive the SHARED editor — the human
+sees the highlighted line move, exactly as if they had clicked. They act on the stopped/focused thread.`;
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
 
@@ -140,10 +143,10 @@ const debugStepSchema = {
         properties: {
             type: {
                 type: "string",
-                enum: ["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch"],
+                enum: ["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause"],
                 description: ""
             },
-            file: { type: "string" },
+            file: { type: "string", description: "File path. Required for setBreakpoint and launch; ignored by flow-control/evaluate steps." },
             line: { type: "number" },
             expression: {
                 description: "A bare expression to evaluate in the resolved stopped frame (e.g. a variable name, '&symbol', '$pc', '$sp'). NOT a debugger CLI command: 'p/x ...', 'info registers', 'x/...', 'monitor ...' are not supported here. For hex output append a ',x' format suffix (e.g. 'value,x').",
@@ -154,7 +157,7 @@ const debugStepSchema = {
                 type: "string"
             },
         },
-        required: ["type", "file"]
+        required: ["type"]
     }
 };
 

@@ -145,6 +145,36 @@ curl -s localhost:4711/tcp -H 'content-type: application/json' \
 
 ---
 
+## Phase 3 — Visible driving (Claude steps, you watch) — READY TO TEST
+
+Claude's flow control now drives the **shared editor**: stepping uses VS Code's native `workbench.action.debug.*` commands, so the highlighted line moves in your editor exactly as if you'd clicked the toolbar. New `debug` step types: `stepOver`, `stepInto`, `stepOut`, `pause`. (Breakpoints were already native — they appear in your gutter — since Phase 1.) `continue` is unchanged (hardware-tested). The `file` field is now optional for steps/continue/evaluate (only `setBreakpoint`/`launch` need it).
+
+Reviewed by two agents; fixes applied: step waiters drained on session end (no stall/cross-session wake), `pause`-when-already-stopped short-circuits, stop `reason` surfaced in the result, attribution TTL widened to 500ms.
+
+**Reload the dev host (Ctrl/Cmd+R)** first.
+
+### Test it (curl) — watch your editor while these run
+
+```bash
+# Stop at a breakpoint, then step — watch the highlighted line advance:
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"debug","arguments":{"steps":[{"type":"stepOver"}]}}'
+# → "Stepped over → .../app_threadx.c:NNN (func) [step]"
+
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"debug","arguments":{"steps":[{"type":"stepInto"}]}}'
+```
+
+### The Phase 3 acceptance gate
+
+1. Stopped at a breakpoint, run a `stepOver` (or `stepInto`/`stepOut`) via curl. **Pass:** your editor's highlighted line advances, and the result reports the new `file:line`.
+2. Have Claude set a breakpoint (the existing `setBreakpoint` step) — it appears in your gutter (already worked in Phase 1).
+3. Optional: `continue` to resume, then `{"type":"pause"}` while running — the target halts and the highlight appears.
+
+These complete **Definition of Done #2** — Claude's breakpoints show in your gutter and Claude's steps move your highlighted line. Stepping acts on the stopped/focused thread; if you've manually focused a *different* thread in the Call Stack, the step follows your focus (shared-session behavior).
+
+---
+
 ## If you hit something
 
 Report: what you evaluated, what the tool returned, and what the VS Code panel showed for the same thread/frame. That, plus whether the `stopped` event had a `threadId`, pinpoints it fast.

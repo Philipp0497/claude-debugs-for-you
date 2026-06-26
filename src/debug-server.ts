@@ -20,8 +20,9 @@ export interface DebugCommand {
 }
 
 export interface DebugStep {
-    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch';
-    file: string;
+    type: 'setBreakpoint' | 'removeBreakpoint' | 'continue' | 'evaluate' | 'launch'
+        | 'stepOver' | 'stepInto' | 'stepOut' | 'pause';
+    file?: string;
     line?: number;
     expression?: string;
     condition?: string;
@@ -33,11 +34,14 @@ interface ToolRequest {
     arguments?: any;
 }
 
-const debugDescription = `Execute a debug plan with breakpoints, launch, continues, and expression 
-evaluation. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track of where 
-you are, if paused on a breakpoint. Make sure to find and get the contents of any requested files. 
-Only use continue when ready to move to the next breakpoint. Launch will bring you to the first 
-breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.`;
+const debugDescription = `Execute a debug plan with breakpoints, launch, continues, stepping, and
+expression evaluation. Step types: setBreakpoint, removeBreakpoint, launch, continue, stepOver, stepInto,
+stepOut, pause, evaluate. ONLY SET BREAKPOINTS BEFORE LAUNCHING OR WHILE PAUSED. Be careful to keep track
+of where you are, if paused on a breakpoint. Make sure to find and get the contents of any requested
+files. Only use continue when ready to move to the next breakpoint. Launch will bring you to the first
+breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT. stepOver/stepInto/stepOut advance one
+line/into/out while paused and pause halts a running target; these drive the SHARED editor — the human
+sees the highlighted line move, exactly as if they had clicked. They act on the stopped/focused thread.`;
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
 
@@ -63,8 +67,8 @@ const getFileContentInputSchema = {
 };
 
 const debugStepSchema = z.object({
-    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch"]).describe(""),
-    file: z.string(),
+    type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause"]).describe(""),
+    file: z.string().describe("File path. Required for setBreakpoint and launch; ignored by flow-control/evaluate steps.").optional(),
     line: z.number().optional(),
     expression: z.string().describe("A bare expression to evaluate in the resolved stopped frame (e.g. a variable name, '&symbol', '$pc', '$sp'). NOT a debugger CLI command: 'p/x ...', 'info registers', 'x/...', 'monitor ...' are not supported here. For hex output append a ',x' format suffix (e.g. 'value,x').").optional(),
     condition: z.string().describe("If needed, a breakpoint condition may be specified to only stop on a breakpoint for some given condition.").optional(),
@@ -528,6 +532,50 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         });
     }
 
+    /**
+     * Drive flow control via the native VS Code command so the human watches the
+     * highlighted line move, exactly as if they had clicked the toolbar (raw
+     * customRequest stepping would not "follow" the editor the same way). The
+     * command acts on the focused thread, which VS Code auto-focuses to the stopped
+     * thread on each stop. Arms a stop-waiter first, then reports the new location.
+     */
+    private async runFlowCommand(command: string, verb: string): Promise<string> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+
+        const stopped = this.tracker.waitForStop();
+        this.tracker.markSelfActivity();
+        await vscode.commands.executeCommand(command);
+        const didStop = await stopped;
+        if (!didStop) {
+            if (!vscode.debug.activeDebugSession) {
+                return `${verb}: target exited / session ended`;
+            }
+            return `${verb} issued, but no stop within timeout — target may still be running`;
+        }
+
+        // Report where execution landed, on the now-stopped thread. The reason is
+        // surfaced so that if an unrelated stop won the race (e.g. a human pause or
+        // another breakpoint), it is visible rather than silently mislabeled.
+        const state = this.tracker.getState(session.id);
+        const threadId = state?.stoppedThreadId ?? (await this.tracker.resolveActiveThreadId(session));
+        const reason = state?.reason ? ` [${state.reason}]` : '';
+        if (threadId !== undefined) {
+            try {
+                const stack = await session.customRequest('stackTrace', { threadId, startFrame: 0, levels: 1 });
+                const top = stack?.stackFrames?.[0];
+                if (top) {
+                    return `${verb} → ${top.source?.path ?? '?'}:${top.line} (${top.name})${reason}`;
+                }
+            } catch {
+                // best-effort location
+            }
+        }
+        return `${verb} complete${reason}`;
+    }
+
     private async handleDebug(payload: { steps: DebugStep[] }): Promise<string[]> {
         const results: string[] = [];
 
@@ -595,6 +643,34 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                     break;
                 }
 
+                case 'stepOver': {
+                    results.push(await this.runFlowCommand('workbench.action.debug.stepOver', 'Stepped over'));
+                    break;
+                }
+
+                case 'stepInto': {
+                    results.push(await this.runFlowCommand('workbench.action.debug.stepInto', 'Stepped into'));
+                    break;
+                }
+
+                case 'stepOut': {
+                    results.push(await this.runFlowCommand('workbench.action.debug.stepOut', 'Stepped out'));
+                    break;
+                }
+
+                case 'pause': {
+                    // Pausing an already-stopped target is a no-op that emits no
+                    // `stopped` event — short-circuit so we don't wait for a stop
+                    // that never comes.
+                    const session = vscode.debug.activeDebugSession;
+                    if (session && this.tracker.getState(session.id)?.isStopped) {
+                        results.push('Already paused');
+                        break;
+                    }
+                    results.push(await this.runFlowCommand('workbench.action.debug.pause', 'Paused'));
+                    break;
+                }
+
                 case 'evaluate': {
                     // Resolve the correct stopped thread + frame from session state.
                     // This replaces the old hardcoded `threadId: 1`, which broke under
@@ -645,7 +721,11 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 }
 
                 case 'launch': {
+                    if (!step.file) {
+                        throw new Error('File path required for launch');
+                    }
                     await this.handleLaunch({ program: step.file });
+                    break;
                 }
             }
         }

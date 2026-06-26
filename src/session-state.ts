@@ -101,7 +101,7 @@ export class SessionStateTracker {
      * customRequest traffic to the tracker, this simply never mis-attributes.
      */
     private lastSelfActivityAt = 0;
-    private static readonly SELF_TTL_MS = 300;
+    private static readonly SELF_TTL_MS = 500;
 
     /**
      * Breakpoint objects the MCP server (Claude) is about to add/remove. Used to
@@ -110,6 +110,14 @@ export class SessionStateTracker {
      * and against the event firing outside the timestamp TTL window.
      */
     private readonly pendingSelfBreakpoints = new Set<vscode.Breakpoint>();
+
+    /**
+     * Resolvers waiting for the next `stopped` event (armed before a step/pause).
+     * Settled with `true` on a stop, or `false` if the session ends first (so a
+     * step that runs to program exit returns promptly instead of stalling, and no
+     * stale waiter survives to be woken by a later session).
+     */
+    private stopWaiters: Array<(stopped: boolean) => void> = [];
 
     /**
      * Register the DebugAdapterTracker factory and session-lifecycle listeners.
@@ -134,6 +142,8 @@ export class SessionStateTracker {
             }),
             vscode.debug.onDidTerminateDebugSession((session) => {
                 this.states.delete(session.id);
+                // Release any pending step/pause waiters (the session is gone).
+                this.settleStopWaiters(false);
                 // When the last session ends, clear the log so the next debug run
                 // does not inherit the previous run's actions.
                 if (this.states.size === 0) {
@@ -197,6 +207,8 @@ export class SessionStateTracker {
                 state.allThreadsStopped = !!body.allThreadsStopped;
                 // Frame ids are reissued on every stop — drop any cached value.
                 state.selectedFrameId = undefined;
+                // Wake anyone awaiting the next stop (e.g. after a step/pause).
+                this.settleStopWaiters(true);
                 break;
             }
             case 'continued': {
@@ -210,6 +222,8 @@ export class SessionStateTracker {
             case 'terminated':
             case 'exited': {
                 this.markRunning(state);
+                // No further stop is coming — release any step/pause waiters.
+                this.settleStopWaiters(false);
                 break;
             }
         }
@@ -288,6 +302,38 @@ export class SessionStateTracker {
     /** Most-recent-last list of recent actions (default 25). */
     getRecentActions(limit: number = 25): DebugAction[] {
         return this.actions.slice(-limit);
+    }
+
+    /**
+     * Resolve `true` when the session next reports a `stopped` event, or `false`
+     * if the session ends or the timeout elapses first. Arm this BEFORE issuing a
+     * step/pause so the caller can report the new location once execution halts.
+     */
+    waitForStop(timeoutMs: number = 7000): Promise<boolean> {
+        return new Promise((resolve) => {
+            let settled = false;
+            const finish = (stopped: boolean) => {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                const i = this.stopWaiters.indexOf(finish);
+                if (i >= 0) {
+                    this.stopWaiters.splice(i, 1);
+                }
+                resolve(stopped);
+            };
+            this.stopWaiters.push(finish);
+            setTimeout(() => finish(false), timeoutMs);
+        });
+    }
+
+    private settleStopWaiters(stopped: boolean): void {
+        const waiters = this.stopWaiters;
+        this.stopWaiters = [];
+        for (const wake of waiters) {
+            wake(stopped);
+        }
     }
 
     /**
