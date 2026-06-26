@@ -2,8 +2,9 @@
 
 **Status:** Phases 1–5 done & HW-validated. **Feature 1 (`explain_fault`) DONE** (commit 713f409,
 core-aware M0+/M7/M33; M7 HW-confirmed, M0+/M33 await silicon). **Feature 2 (session lifecycle) DONE**
-(commit a33ed00, HW-confirmed — recovered a faulted session, no VS Code touch). Remaining items below,
-ordered by leverage. Each has a one-line *why*, a *gate* (confirm on the live STM32+ThreadX board), and
+(commit a33ed00, HW-confirmed — recovered a faulted session, no VS Code touch). **Feature 4 (ThreadX TCB
+introspection) DONE** (commit 878be01, HW-confirmed — retired both open findings #2 + ENV). Remaining
+items below, ordered by leverage. Each has a one-line *why*, a *gate* (confirm on the live STM32+ThreadX board), and
 an *impl sketch* against the real source.
 
 Validated target for all gates: Nucleo-F746ZG (Cortex-M7F), ThreadX + NetX Duo, cortex-debug +
@@ -23,13 +24,14 @@ OpenOCD + arm-none-eabi-gdb, MCP over `http://localhost:3333/mcp` (+ `/tcp` + `/
 - **Surface the real stop reason** in any stepping/halting result — single-stepping on this target
   lands in the TIM6 timebase ISR and returns `reason=exception` (benign). (Phase 3.)
 
-Open findings to fix opportunistically:
+Open findings — BOTH RETIRED by Feature 4 (commit 878be01, HW-confirmed):
 
-- **#2** `read_special_reg{threadId}` for a *non-current* thread returns the running thread's global
-  hardware regs (`psp`/`msp`/`control`); only `sp` is per-thread. Null the global-only regs for
-  non-current threads (Feature 4 below fixes this properly).
-- **ENV** OpenOCD's ThreadX unwinder produces garbage frames for non-stopped threads on the M7
-  (FPU-stacking offset / `EXC_RETURN` FType not detected). Feature 4 sidesteps it.
+- **#2** ~~`read_special_reg{threadId}` for a non-current thread returns the running thread's global
+  hardware regs~~ → RETIRED: those globals are now nulled for non-current threads; use `inspect_tcb`'s
+  `savedSp` for the authoritative per-thread SP.
+- **ENV** ~~OpenOCD's ThreadX unwinder produces garbage frames for non-stopped threads~~ → RETIRED:
+  `inspect_tcb` decodes the saved PC straight from the TCB context (+60/+124 by EXC_RETURN), bypassing
+  OpenOCD's unwinder.
 
 ---
 
@@ -102,7 +104,11 @@ group) → the counter set, matching a raw memory read of the same addresses.
 **Impl sketch:** parse the device SVD (STM32F746 CMSIS-SVD) once; map `PERIPH.REG` → address + field
 layout; reuse the memory-read path; pretty-print fields. Arg `{ path, fields? }`.
 
-### Feature 4 — ThreadX TCB introspection  `thread_stack_usage` / `inspect_tcb`  (also fixes #2 + ENV)
+### Feature 4 — ThreadX TCB introspection  `thread_stack_usage` / `inspect_tcb`  — DONE (commit 878be01) ✅
+
+**DONE / HW-confirmed:** all 7 threads' high-water matched their source stack sizes; non-current threads
+decode to real `_tx_thread_system_suspend`/`_tx_thread_shell_entry` frames (no more `??@0x4`). Retired
+both open findings (#2 + ENV). Saved-PC offsets verified: +60 non-FP / +124 FP from `tx_thread_stack_ptr`.
 
 **Why:** per-thread stack high-water marks (overflow early-warning) and a *correct* non-current-thread
 unwind that doesn't depend on OpenOCD's broken ThreadX decoder.
