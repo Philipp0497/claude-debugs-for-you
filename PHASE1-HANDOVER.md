@@ -109,9 +109,39 @@ claude mcp add --transport stdio debug --scope project -- node "<paste the copie
 
 ## Explicitly deferred (not bugs)
 
-- `get_debug_state` + observing your manual UI actions → **Phase 2**.
 - `list_threads` / `select_thread` / `get_registers` / `get_variables` / `gdb_exec` / watchpoints / per-thread stacks → **Phase 4–5**.
+- Making Claude's actions visible via native VS Code APIs (gutter breakpoints, highlighted-line stepping) → **Phase 3**.
 - Streamable-HTTP MCP endpoint → **Phase 5**.
+
+---
+
+## Phase 2 — Shared awareness (`get_debug_state`) — READY TO TEST
+
+New `get_debug_state` MCP tool + a DebugAdapterTracker that watches the human's UI actions, so Claude can re-sync after the human drives manually. Reviewed by two agents; attribution hardened (object-identity for breakpoints, repl-only evaluate logging, log cleared when the session ends).
+
+**Reload the dev host (Ctrl/Cmd+R)** to pick up the rebuilt `out/` + `mcp/build` first.
+
+### What `get_debug_state` returns
+
+`status` (stopped/running/no-session), `session`, `reason`, `stoppedThread` `{id,name}`, `location` `{file,line,function}` (live), `threads`, `breakpoints` (live from VS Code, 1-based lines), and `recentActions` — a log of recent flow-control, breakpoint, and console actions, each tagged `human` or `claude`.
+
+### Test it (curl)
+
+```bash
+# Snapshot while stopped at a breakpoint
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"get_debug_state","arguments":{}}' | python3 -m json.tool
+```
+
+(Result is under `.data`.) Expect `status:"stopped"`, the correct `stoppedThread`/`location`, and your current breakpoints.
+
+### The Phase 2 acceptance gate
+
+1. Stop at a breakpoint. Take a `get_debug_state` snapshot.
+2. **Now drive manually in the VS Code UI** (no MCP/Claude calls): press **Step Over (F10)** once, then **add a breakpoint** by clicking a gutter on another line.
+3. Take another `get_debug_state`.
+
+**Pass:** the second snapshot shows the **new `location`** (after the step), the **new breakpoint** in `breakpoints`, and `recentActions` containing a `step-over` and a `breakpoint-added` — both tagged **`source:"human"`** — even though Claude was never told. That's the handoff working: Claude can catch up on what you did.
 
 ---
 

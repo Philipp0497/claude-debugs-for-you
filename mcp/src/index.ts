@@ -96,8 +96,14 @@ breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.`;
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
 
-const getFileContentDescription = `Get file content with line numbers - you likely need to list files 
+const getFileContentDescription = `Get file content with line numbers - you likely need to list files
 to understand what files are available. Be careful to use absolute paths.`;
+
+const getDebugStateDescription = `Get the current state of the SHARED debug session: running/stopped, stop
+reason, the active stopped thread, current source location, all threads, all breakpoints, and a log of
+recent actions (each tagged human or claude). The session is SHARED with a human who may step, set
+breakpoints, or change focus at any time — call this after any pause in your activity to re-sync before
+acting on a stale picture.`;
 
 // Zod schemas for the tools
 const listFilesInputSchema = {
@@ -177,6 +183,11 @@ const tools = [
         description: debugDescription, // Make sure this variable is defined in your code
         inputSchema: debugInputSchema,
     },
+    {
+        name: "get_debug_state",
+        description: getDebugStateDescription,
+        inputSchema: { type: "object", properties: {} },
+    },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -190,10 +201,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         arguments: request.params.arguments
     });
 
+    let text: string;
+    if (Array.isArray(response)) {
+        text = response.join("\n");
+    } else if (typeof response === "string") {
+        text = response;
+    } else {
+        // Structured tool results (e.g. get_debug_state) come back as objects.
+        text = JSON.stringify(response, null, 2);
+    }
+
     return {
         content: [{
             type: "text",
-            text: Array.isArray(response) ? response.join("\n") : response
+            text
         }]
     };
 });

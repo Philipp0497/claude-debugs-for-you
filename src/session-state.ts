@@ -43,6 +43,25 @@ export interface ResolvedFrame {
     frameId: number;
 }
 
+/** Who initiated an action, best-effort. */
+export type DebugActionSource = 'human' | 'claude';
+
+/**
+ * One entry in the shared-session action log. Captures user-meaningful actions
+ * (flow control, deliberate evaluates, breakpoint edits) so Claude can catch up
+ * on what the human did while it was idle.
+ */
+export interface DebugAction {
+    /** `Date.now()` at capture. */
+    ts: number;
+    /** Best-effort attribution (see the self-activity marker). */
+    source: DebugActionSource;
+    /** e.g. 'step-over', 'continue', 'pause', 'evaluate', 'breakpoint-added'. */
+    kind: string;
+    /** Human-readable detail: file:line, expression, etc. */
+    detail?: string;
+}
+
 /**
  * The debug type(s) the tracker attaches to. '*' matches every debug adapter,
  * which keeps the fix generic (it also fixes multi-thread targets for other
@@ -50,8 +69,47 @@ export interface ResolvedFrame {
  */
 const TRACKED_DEBUG_TYPE = '*';
 
+/** DAP request command -> human-friendly flow-control action kind. */
+const FLOW_KINDS: Record<string, string> = {
+    next: 'step-over',
+    stepIn: 'step-in',
+    stepOut: 'step-out',
+    continue: 'continue',
+    pause: 'pause',
+    goto: 'goto',
+    reverseContinue: 'reverse-continue',
+    stepBack: 'step-back',
+};
+
 export class SessionStateTracker {
     private readonly states = new Map<string, SessionState>();
+
+    /**
+     * Global ring buffer of recent actions across the (single, shared) session.
+     * Breakpoints are workspace-scoped in VS Code, so a single log is the natural
+     * fit rather than a per-session one.
+     */
+    private readonly actions: DebugAction[] = [];
+    private static readonly MAX_ACTIONS = 100;
+
+    /**
+     * Timestamp of the last action the MCP server (Claude) initiated. Any tracked
+     * action seen within SELF_TTL_MS is attributed to 'claude', otherwise 'human'.
+     * This is best-effort: the extension host is single-threaded, so a human cannot
+     * realistically interleave a UI action inside the few hundred ms around Claude's
+     * synchronous tool execution. If the adapter never surfaces Claude's own
+     * customRequest traffic to the tracker, this simply never mis-attributes.
+     */
+    private lastSelfActivityAt = 0;
+    private static readonly SELF_TTL_MS = 300;
+
+    /**
+     * Breakpoint objects the MCP server (Claude) is about to add/remove. Used to
+     * attribute `onDidChangeBreakpoints` entries by object identity — robust
+     * against VS Code batching a human edit and a Claude edit into one event,
+     * and against the event firing outside the timestamp TTL window.
+     */
+    private readonly pendingSelfBreakpoints = new Set<vscode.Breakpoint>();
 
     /**
      * Register the DebugAdapterTracker factory and session-lifecycle listeners.
@@ -64,6 +122,9 @@ export class SessionStateTracker {
                 createDebugAdapterTracker: (session) => {
                     this.ensure(session);
                     return {
+                        // editor -> adapter: observe the human's UI-initiated actions
+                        onWillReceiveMessage: (message: any) => this.onWillReceiveMessage(message),
+                        // adapter -> editor: track stopped/continued/terminated state
                         onDidSendMessage: (message: any) => this.onDidSendMessage(session, message),
                     };
                 },
@@ -73,6 +134,25 @@ export class SessionStateTracker {
             }),
             vscode.debug.onDidTerminateDebugSession((session) => {
                 this.states.delete(session.id);
+                // When the last session ends, clear the log so the next debug run
+                // does not inherit the previous run's actions.
+                if (this.states.size === 0) {
+                    this.actions.length = 0;
+                    this.pendingSelfBreakpoints.clear();
+                }
+            }),
+            // Breakpoint edits are workspace-scoped and come through a high-level
+            // event (cleaner than parsing setBreakpoints DAP requests, and it carries
+            // enabled/condition). Covers both human gutter edits and Claude's
+            // addBreakpoints/removeBreakpoints, attributed by object identity.
+            // 'changed' is mostly adapter verification noise, so it is not logged.
+            vscode.debug.onDidChangeBreakpoints((e) => {
+                for (const bp of e.added) {
+                    this.record('breakpoint-added', describeBreakpoint(bp), this.takeBreakpointSource(bp));
+                }
+                for (const bp of e.removed) {
+                    this.record('breakpoint-removed', describeBreakpoint(bp), this.takeBreakpointSource(bp));
+                }
             }),
         );
     }
@@ -141,6 +221,73 @@ export class SessionStateTracker {
         state.reason = undefined;
         state.allThreadsStopped = undefined;
         state.selectedFrameId = undefined;
+    }
+
+    /**
+     * Observe editor -> adapter requests to log user-meaningful actions: flow
+     * control (step/continue/pause/...) and deliberate evaluates. Inspection
+     * plumbing (threads/stackTrace/scopes/variables) and hover evaluates are
+     * intentionally ignored to keep the log signal-rich. Breakpoints are handled
+     * via onDidChangeBreakpoints instead.
+     */
+    private onWillReceiveMessage(message: any): void {
+        if (!message || message.type !== 'request') {
+            return;
+        }
+        const flow = FLOW_KINDS[message.command];
+        if (flow) {
+            this.record(flow, undefined);
+            return;
+        }
+        if (message.command === 'evaluate') {
+            const args = message.arguments ?? {};
+            // Only deliberate REPL/console input is a meaningful action. 'hover',
+            // 'watch', 'variables', and 'clipboard' are inspection-panel refreshes
+            // (noise), and Claude's own value reads use 'watch' — it already knows
+            // what it read.
+            if (args.context === 'repl') {
+                this.record('evaluate', args.expression);
+            }
+        }
+    }
+
+    /**
+     * Mark that the MCP server (Claude) is about to issue a flow-control request
+     * (continue). Call SYNCHRONOUSLY right before the customRequest so the resulting
+     * tracked action is attributed to 'claude'. onWillReceiveMessage fires at editor
+     * send time (not after the adapter round-trip), so the short TTL is ample.
+     * Breakpoints use object-identity correlation instead (see markSelfBreakpoints).
+     */
+    markSelfActivity(): void {
+        this.lastSelfActivityAt = Date.now();
+    }
+
+    /** Register breakpoint objects Claude is about to add/remove for attribution. */
+    markSelfBreakpoints(bps: readonly vscode.Breakpoint[]): void {
+        for (const bp of bps) {
+            this.pendingSelfBreakpoints.add(bp);
+        }
+    }
+
+    private takeBreakpointSource(bp: vscode.Breakpoint): DebugActionSource {
+        return this.pendingSelfBreakpoints.delete(bp) ? 'claude' : 'human';
+    }
+
+    private currentSource(): DebugActionSource {
+        return Date.now() - this.lastSelfActivityAt < SessionStateTracker.SELF_TTL_MS ? 'claude' : 'human';
+    }
+
+    private record(kind: string, detail: string | undefined, source?: DebugActionSource): void {
+        this.actions.push({ ts: Date.now(), source: source ?? this.currentSource(), kind, detail });
+        const overflow = this.actions.length - SessionStateTracker.MAX_ACTIONS;
+        if (overflow > 0) {
+            this.actions.splice(0, overflow);
+        }
+    }
+
+    /** Most-recent-last list of recent actions (default 25). */
+    getRecentActions(limit: number = 25): DebugAction[] {
+        return this.actions.slice(-limit);
     }
 
     /**
@@ -249,4 +396,16 @@ export class SessionStateTracker {
         }
         return threadId;
     }
+}
+
+/** Short, human-readable description of a breakpoint for the action log. */
+function describeBreakpoint(bp: vscode.Breakpoint): string {
+    if (bp instanceof vscode.SourceBreakpoint) {
+        const line = bp.location.range.start.line + 1;
+        return `${bp.location.uri.fsPath}:${line}`;
+    }
+    if (bp instanceof vscode.FunctionBreakpoint) {
+        return `fn ${bp.functionName}`;
+    }
+    return 'breakpoint';
 }

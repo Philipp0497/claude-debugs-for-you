@@ -41,10 +41,18 @@ breakpoint. DO NOT USE CONTINUE TO GET TO THE FIRST BREAKPOINT.`;
 
 const listFilesDescription = "List all files in the workspace. Use this to find any requested files.";
 
-const getFileContentDescription = `Get file content with line numbers - you likely need to list files 
+const getFileContentDescription = `Get file content with line numbers - you likely need to list files
 to understand what files are available. Be careful to use absolute paths.`;
 
+const getDebugStateDescription = `Get the current state of the SHARED debug session: running/stopped, stop
+reason, the active stopped thread, current source location, all threads, all breakpoints, and a log of
+recent actions (each tagged human or claude). The session is SHARED with a human who may step, set
+breakpoints, or change focus at any time — call this after any pause in your activity to re-sync before
+acting on a stale picture.`;
+
 // Zod schemas for the tools
+const getDebugStateInputSchema = {};
+
 const listFilesInputSchema = {
     includePatterns: z.array(z.string()).describe("Glob patterns to include (e.g. ['**/*.js'])").optional(),
     excludePatterns: z.array(z.string()).describe("Glob patterns to exclude (e.g. ['node_modules/**'])").optional(),
@@ -82,6 +90,11 @@ const tools = [
         name: "debug",
         description: debugDescription, // Make sure this variable is defined in your code
         inputSchema: debugInputSchema,
+    },
+    {
+        name: "get_debug_state",
+        description: getDebugStateDescription,
+        inputSchema: getDebugStateInputSchema,
     },
 ];
 export class DebugServer extends EventEmitter implements DebugServerEvents {
@@ -121,6 +134,11 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         this.mcpServer.tool("debug", debugDescription, debugInputSchema, async (args: any) => {
             const results = await this.handleDebug(args);
             return { content: [{ type: "text", text: results.join('\n') }] };
+        });
+
+        this.mcpServer.tool("get_debug_state", getDebugStateDescription, getDebugStateInputSchema, async () => {
+            const state = await this.handleGetDebugState();
+            return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
         });
     }
 
@@ -289,6 +307,8 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return await this.handleGetFile(request.arguments);
             case 'debug':
                 return await this.handleDebug(request.arguments);
+            case 'get_debug_state':
+                return await this.handleGetDebugState();
             default:
                 throw new Error(`Unknown tool: ${request.tool}`);
         }
@@ -423,6 +443,91 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         return lines.map((line, i) => `${i + 1}: ${line}`).join('\n');
     }
 
+    /**
+     * Assemble a snapshot of the shared debug session for Claude to re-sync after
+     * the human may have acted: live status/location/threads/breakpoints from VS
+     * Code + the DAP session, plus the tracker's recent-action log.
+     */
+    private async handleGetDebugState(): Promise<any> {
+        const breakpoints = this.describeBreakpoints();
+        const recentActions = this.tracker.getRecentActions();
+
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            return { status: 'no-session', session: null, breakpoints, recentActions };
+        }
+
+        const state = this.tracker.getState(session.id);
+        const isStopped = !!state?.isStopped;
+
+        const result: any = {
+            status: isStopped ? 'stopped' : 'running',
+            session: { id: session.id, type: session.type, name: session.name },
+            reason: state?.reason,
+            allThreadsStopped: state?.allThreadsStopped,
+            stoppedThread: null,
+            location: null,
+            threads: [],
+            breakpoints,
+            recentActions,
+        };
+
+        // Live thread list (only meaningful while stopped; tolerate failure).
+        try {
+            const resp = await session.customRequest('threads');
+            const threads = (resp?.threads ?? []).map((t: any) => ({ id: t.id, name: t.name }));
+            result.threads = threads;
+            if (state?.stoppedThreadId !== undefined) {
+                result.stoppedThread =
+                    threads.find((t: any) => t.id === state.stoppedThreadId) ??
+                    { id: state.stoppedThreadId, name: undefined };
+            }
+        } catch {
+            // not stopped / adapter can't list threads while running
+        }
+
+        // Live current source location of the stopped thread's top frame.
+        if (isStopped) {
+            const threadId = state?.stoppedThreadId ?? (await this.tracker.resolveActiveThreadId(session));
+            if (threadId !== undefined) {
+                try {
+                    const stack = await session.customRequest('stackTrace', { threadId, startFrame: 0, levels: 1 });
+                    const top = stack?.stackFrames?.[0];
+                    if (top) {
+                        result.location = {
+                            file: top.source?.path,
+                            line: top.line,
+                            function: top.name,
+                        };
+                    }
+                } catch {
+                    // ignore — location is best-effort
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private describeBreakpoints(): any[] {
+        return vscode.debug.breakpoints.map((bp) => {
+            if (bp instanceof vscode.SourceBreakpoint) {
+                return {
+                    type: 'source',
+                    file: bp.location.uri.fsPath,
+                    line: bp.location.range.start.line + 1,
+                    enabled: bp.enabled,
+                    condition: bp.condition,
+                    hitCondition: bp.hitCondition,
+                };
+            }
+            if (bp instanceof vscode.FunctionBreakpoint) {
+                return { type: 'function', functionName: bp.functionName, enabled: bp.enabled, condition: bp.condition };
+            }
+            return { type: 'other', enabled: bp.enabled };
+        });
+    }
+
     private async handleDebug(payload: { steps: DebugStep[] }): Promise<string[]> {
         const results: string[] = [];
 
@@ -448,6 +553,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         true,
                         step.condition,
                     );
+                    this.tracker.markSelfBreakpoints([bp]);
                     await vscode.debug.addBreakpoints([bp]);
                     results.push(`Set breakpoint at line ${step.line}`);
                     break;
@@ -463,6 +569,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         }
                         return false;
                     });
+                    this.tracker.markSelfBreakpoints(bps);
                     await vscode.debug.removeBreakpoints(bps);
                     results.push(`Removed breakpoint at line ${step.line}`);
                     break;
@@ -482,6 +589,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         throw new Error('No threads available to continue');
                     }
 
+                    this.tracker.markSelfActivity();
                     await session.customRequest('continue', { threadId });
                     results.push('Continued execution');
                     break;
