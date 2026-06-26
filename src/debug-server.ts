@@ -158,6 +158,25 @@ with the source line. Returns {fault:false} for a benign 'exception' stop. Call 
 
 const explainFaultInputSchema = {};
 
+const startSessionDescription = `Launch the debug session on the SHARED setup from a launch.json
+configuration (works with launch OR attach configs). REFUSES if a session is already active — use
+restart_session to relaunch. After launch the target typically halts at entry/main; the result reports
+whether it stopped. 'config' defaults to the first launch.json configuration. This is a VISIBLE action —
+VS Code shows the session starting.`;
+
+const restartSessionDescription = `(Re)launch the debug session on the SHARED setup: stops any active
+session, then starts the named (or first) launch.json configuration. Use this to recover the session
+yourself after a destructive test (a forced fault, a reflash) instead of asking the human to reload VS
+Code. Reports whether the target halted at entry. 'config' defaults to the first launch.json configuration.`;
+
+const startSessionInputSchema = {
+    config: z.string().describe("launch.json configuration name (launch or attach); defaults to the first.").optional(),
+};
+
+const restartSessionInputSchema = {
+    config: z.string().describe("launch.json configuration name (launch or attach); defaults to the first.").optional(),
+};
+
 // Standard ARM Cortex-M special/system registers to read when no specific name is
 // given. msplim/psplim exist only on ARMv8-M (e.g. Cortex-M33); they read back as
 // null (unavailable) on ARMv7-M (e.g. Cortex-M7).
@@ -299,6 +318,16 @@ const tools = [
         description: explainFaultDescription,
         inputSchema: explainFaultInputSchema,
     },
+    {
+        name: "start_session",
+        description: startSessionDescription,
+        inputSchema: startSessionInputSchema,
+    },
+    {
+        name: "restart_session",
+        description: restartSessionDescription,
+        inputSchema: restartSessionInputSchema,
+    },
 ];
 export class DebugServer extends EventEmitter implements DebugServerEvents {
     private server: net.Server | null = null;
@@ -408,6 +437,16 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
 
         server.tool("explain_fault", explainFaultDescription, explainFaultInputSchema, async () => {
             const result = await this.handleExplainFault();
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        server.tool("start_session", startSessionDescription, startSessionInputSchema, async (args: any) => {
+            const result = await this.handleSessionLaunch(args, false);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        server.tool("restart_session", restartSessionDescription, restartSessionInputSchema, async (args: any) => {
+            const result = await this.handleSessionLaunch(args, true);
             return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         });
 
@@ -657,6 +696,10 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return await this.handleWriteMemory(request.arguments);
             case 'explain_fault':
                 return await this.handleExplainFault();
+            case 'start_session':
+                return await this.handleSessionLaunch(request.arguments, false);
+            case 'restart_session':
+                return await this.handleSessionLaunch(request.arguments, true);
             default:
                 throw new Error(`Unknown tool: ${request.tool}`);
         }
@@ -1411,6 +1454,106 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             ctx.note = `Could not recover pre-fault context: ${err instanceof Error ? err.message : String(err)}`;
         }
         return ctx;
+    }
+
+    /**
+     * Launch (or restart) the debug session from a launch.json configuration so
+     * Claude can recover the session itself after a destructive test. start_session
+     * refuses when one is already active; restart_session stops it first. Arms a
+     * stop-waiter after any teardown so the run-to-entry halt is what resolves it.
+     */
+    private async handleSessionLaunch(payload: { config?: string }, restart: boolean): Promise<any> {
+        const folder = vscode.workspace.workspaceFolders?.[0];
+        if (!folder) {
+            throw new Error('No workspace folder found');
+        }
+
+        const existing = vscode.debug.activeDebugSession;
+        if (existing && !restart) {
+            throw new Error(`A debug session ("${existing.name}") is already active. Use restart_session to relaunch.`);
+        }
+
+        const launchConfig = vscode.workspace.getConfiguration('launch', folder.uri);
+        const configs = launchConfig.get<any[]>('configurations') ?? [];
+        if (configs.length === 0) {
+            throw new Error('No configurations found in launch.json');
+        }
+        let chosen: any;
+        if (payload?.config) {
+            chosen = configs.find((c) => c?.name === payload.config);
+            if (!chosen) {
+                const names = configs.map((c) => c?.name).filter(Boolean).join(', ');
+                throw new Error(`No launch configuration named "${payload.config}". Available: ${names}`);
+            }
+        } else {
+            chosen = configs[0];
+        }
+
+        if (existing) {
+            await vscode.debug.stopDebugging(existing);
+            // Wait for the adapter to actually tear down (OpenOCD disconnect can lag)
+            // rather than a fixed delay: poll until the old session is no longer active.
+            const deadline = Date.now() + 8000;
+            while (vscode.debug.activeDebugSession?.id === existing.id && Date.now() < deadline) {
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            await new Promise((resolve) => setTimeout(resolve, 250)); // brief settle
+        }
+
+        const ok = await vscode.debug.startDebugging(folder, chosen.name ?? chosen);
+        if (!ok) {
+            throw new Error(`Failed to start debugging with configuration "${chosen.name ?? '(unnamed)'}"`);
+        }
+
+        // Wait for the NEW session (distinct from any we just stopped) to become active.
+        const session = await this.waitForNewSession(existing?.id, 8000);
+        if (!session) {
+            throw new Error('Debug session did not become active after start');
+        }
+
+        // Wait for the run-to-entry halt by polling the NEW session's tracked state.
+        // This is session-scoped, so the OLD session's terminate event cannot make us
+        // report "running" for a target that actually halted.
+        const stopDeadline = Date.now() + 20000;
+        while (
+            !this.tracker.getState(session.id)?.isStopped &&
+            vscode.debug.activeDebugSession?.id === session.id &&
+            Date.now() < stopDeadline
+        ) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        const state = this.tracker.getState(session.id);
+
+        return {
+            started: true,
+            restarted: restart && !!existing,
+            config: chosen.name ?? '(unnamed)',
+            session: { id: session.id, type: session.type, name: session.name },
+            status: state?.isStopped ? 'stopped' : 'running',
+            reason: state?.reason,
+        };
+    }
+
+    /**
+     * Resolve the active debug session once one is present whose id differs from
+     * `excludeId` (used after a restart so we never return the dying old session).
+     * Resolves undefined on timeout if no distinct session appeared.
+     */
+    private waitForNewSession(excludeId: string | undefined, timeoutMs: number): Promise<vscode.DebugSession | undefined> {
+        return new Promise((resolve) => {
+            const deadline = Date.now() + timeoutMs;
+            const check = () => {
+                const s = vscode.debug.activeDebugSession;
+                if (s && s.id !== excludeId) {
+                    resolve(s);
+                } else if (Date.now() >= deadline) {
+                    resolve(undefined);
+                } else {
+                    setTimeout(check, 100);
+                }
+            };
+            check();
+        });
     }
 
     /**

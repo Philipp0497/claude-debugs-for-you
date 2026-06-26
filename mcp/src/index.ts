@@ -159,6 +159,16 @@ and ARMv8-M Baseline (M23): HardFault-only — verdict from ICSR.VECTACTIVE + th
 the PRE-FAULT context (faulting PC/LR/xPSR + R0-R3/R12) from the stacked exception frame via EXC_RETURN,
 with the source line. Returns {fault:false} for a benign 'exception' stop. Call while stopped in the handler.`;
 
+const startSessionDescription = `Launch the debug session on the SHARED setup from a launch.json
+configuration (works with launch OR attach configs). REFUSES if a session is already active — use
+restart_session to relaunch. After launch the target typically halts at entry/main; the result reports
+whether it stopped. 'config' defaults to the first launch.json configuration. This is a VISIBLE action.`;
+
+const restartSessionDescription = `(Re)launch the debug session on the SHARED setup: stops any active
+session, then starts the named (or first) launch.json configuration. Use this to recover the session
+yourself after a destructive test (a forced fault, a reflash) instead of asking the human to reload VS
+Code. Reports whether the target halted at entry. 'config' defaults to the first launch.json configuration.`;
+
 // Zod schemas for the tools
 const listFilesInputSchema = {
     type: "object",
@@ -353,6 +363,26 @@ const tools = [
         name: "explain_fault",
         description: explainFaultDescription,
         inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "start_session",
+        description: startSessionDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                config: { type: "string", description: "launch.json configuration name (launch or attach); defaults to the first." }
+            }
+        },
+    },
+    {
+        name: "restart_session",
+        description: restartSessionDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                config: { type: "string", description: "launch.json configuration name (launch or attach); defaults to the first." }
+            }
+        },
     },
 ];
 

@@ -298,6 +298,32 @@ curl -s localhost:3333/tcp -H 'content-type: application/json' \
 
 ---
 
+## Feature 2 (Phase 6) — session lifecycle (`start_session` / `restart_session`) — READY TO TEST
+
+Lets Claude (re)launch the cortex-debug session itself — so a destructive test (a forced fault, a reflash) no longer needs you to reload VS Code. Tools 16 & 17.
+
+- **`start_session {config?}`** — launches a launch.json config (launch *or* attach). **Refuses** if a session is already active.
+- **`restart_session {config?}`** — stops any active session, waits for it to tear down, then launches fresh. Use this to recover a dead/faulted session. With no active session it just starts.
+- `config` defaults to the first launch.json configuration; pass a name (e.g. `"TCP board F746ZG (Cortex-Debug, pinned ST-Link)"`) to pick another. Both report `status: stopped|running` once the target halts at entry — detected **session-scoped** (immune to the old session's terminate event) and waiting for a session **distinct** from the one stopped.
+
+**One-time:** you still need to reload the dev host now to load the F2 build (the reload itself drops the current session). **After that, `restart_session` recovers future dead sessions without touching VS Code** — that's the payoff.
+
+### Test it
+
+```bash
+# After the reload (no active session) — launch and confirm it halts at entry:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"restart_session","arguments":{}}'        # → {started:true, status:"stopped", ...}
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"get_debug_state","arguments":{}}'        # → status:stopped, location at main/entry
+```
+
+### The gate (Feature 2)
+
+With no active session, `restart_session` brings the board up halted at entry and a subsequent `get_debug_state` shows `status: stopped` — **without you touching VS Code**. The real payoff test: force a fault (F1's `set $pc` trick) to kill the run, then call `restart_session` (no reload) → it tears down the faulted session and relaunches to a clean stopped-at-entry state. (`start_session` on an already-active session should refuse and point you to `restart_session`.)
+
+---
+
 ## If you hit something
 
 Report: what you evaluated, what the tool returned, and what the VS Code panel showed for the same thread/frame. That, plus whether the `stopped` event had a `threadId`, pinpoints it fast.
