@@ -149,6 +149,15 @@ const writeMemoryInputSchema = {
     data: z.string().describe("Hex bytes to write, e.g. 'deadbeef' or 'de ad be ef'."),
 };
 
+const explainFaultDescription = `Decode the current ARM Cortex-M fault on the SHARED session. Auto-detects
+the core via CPUID. On ARMv7-M (M3/M4/M7) and ARMv8-M Mainline (M33/M55/M85): decodes CFSR/HFSR/MMFAR/BFAR
+(+ UFSR.STKOF stack-overflow and SecureFault SFSR/SFAR on v8-M) into plain English. On ARMv6-M (M0/M0+)
+and ARMv8-M Baseline (M23): HardFault-only — verdict from ICSR.VECTACTIVE + the stacked PC. Always recovers
+the PRE-FAULT context (faulting PC/LR/xPSR + R0-R3/R12) from the stacked exception frame via EXC_RETURN,
+with the source line. Returns {fault:false} for a benign 'exception' stop. Call while stopped in the handler.`;
+
+const explainFaultInputSchema = {};
+
 // Standard ARM Cortex-M special/system registers to read when no specific name is
 // given. msplim/psplim exist only on ARMv8-M (e.g. Cortex-M33); they read back as
 // null (unavailable) on ARMv7-M (e.g. Cortex-M7).
@@ -160,6 +169,37 @@ const SPECIAL_REGS = ['sp', 'lr', 'pc', 'xpsr', 'msp', 'psp', 'primask', 'basepr
 // contrast sp/lr/pc/xpsr are reconstructed from a thread's saved stack frame and
 // are per-thread (note: non-current unwinds depend on the gdb-server's RTOS support).
 const GLOBAL_ONLY_REGS = new Set(['msp', 'psp', 'control', 'primask', 'basepri', 'faultmask', 'msplim', 'psplim']);
+
+// CPUID PartNo (bits[15:4]) -> core capabilities. configurableFaults = has the
+// CFSR/HFSR/MMFAR/BFAR block (ARMv7-M and ARMv8-M Mainline). v8m = ARMv8-M (adds
+// UFSR.STKOF + SecureFault SFSR/SFAR). NOTE: Cortex-M23 is v8-M but HardFault-only,
+// so capability is keyed per-part, NOT off v8m.
+const CORTEX_CORES: Record<number, { name: string; configurableFaults: boolean; v8m: boolean }> = {
+    0xc20: { name: 'Cortex-M0', configurableFaults: false, v8m: false },
+    0xc60: { name: 'Cortex-M0+', configurableFaults: false, v8m: false },
+    0xc21: { name: 'Cortex-M1', configurableFaults: false, v8m: false },
+    0xc23: { name: 'Cortex-M3', configurableFaults: true, v8m: false },
+    0xc24: { name: 'Cortex-M4', configurableFaults: true, v8m: false },
+    0xc27: { name: 'Cortex-M7', configurableFaults: true, v8m: false },
+    0xd20: { name: 'Cortex-M23', configurableFaults: false, v8m: true },
+    0xd21: { name: 'Cortex-M33', configurableFaults: true, v8m: true },
+    0xd22: { name: 'Cortex-M55', configurableFaults: true, v8m: true },
+    0xd23: { name: 'Cortex-M85', configurableFaults: true, v8m: true },
+    0xd31: { name: 'Cortex-M35P', configurableFaults: true, v8m: true },
+};
+
+// ICSR.VECTACTIVE exception numbers that are CPU faults.
+const FAULT_EXCEPTIONS: Record<number, string> = {
+    3: 'HardFault',
+    4: 'MemManage',
+    5: 'BusFault',
+    6: 'UsageFault',
+    7: 'SecureFault',
+};
+
+function hex32(n: number): string {
+    return '0x' + (n >>> 0).toString(16).padStart(8, '0');
+}
 
 const listFilesInputSchema = {
     includePatterns: z.array(z.string()).describe("Glob patterns to include (e.g. ['**/*.js'])").optional(),
@@ -253,6 +293,11 @@ const tools = [
         name: "write_memory",
         description: writeMemoryDescription,
         inputSchema: writeMemoryInputSchema,
+    },
+    {
+        name: "explain_fault",
+        description: explainFaultDescription,
+        inputSchema: explainFaultInputSchema,
     },
 ];
 export class DebugServer extends EventEmitter implements DebugServerEvents {
@@ -358,6 +403,11 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
 
         server.tool("write_memory", writeMemoryDescription, writeMemoryInputSchema, async (args: any) => {
             const result = await this.handleWriteMemory(args);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        server.tool("explain_fault", explainFaultDescription, explainFaultInputSchema, async () => {
+            const result = await this.handleExplainFault();
             return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         });
 
@@ -605,6 +655,8 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return await this.handleReadMemory(request.arguments);
             case 'write_memory':
                 return await this.handleWriteMemory(request.arguments);
+            case 'explain_fault':
+                return await this.handleExplainFault();
             default:
                 throw new Error(`Unknown tool: ${request.tool}`);
         }
@@ -1109,6 +1161,256 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             data: buf.toString('base64'),
         });
         return { address: memoryReference, bytesWritten: resp?.bytesWritten ?? buf.length };
+    }
+
+    /** Read a little-endian u32 from an absolute address (frame-independent). */
+    private async readU32(session: vscode.DebugSession, addr: number): Promise<number> {
+        const resp = await session.customRequest('readMemory', {
+            memoryReference: '0x' + (addr >>> 0).toString(16),
+            offset: 0,
+            count: 4,
+        });
+        const data = resp?.data ? Buffer.from(resp.data, 'base64') : Buffer.alloc(0);
+        if (data.length < 4) {
+            throw new Error(`Could not read 4 bytes at 0x${(addr >>> 0).toString(16)}`);
+        }
+        return data.readUInt32LE(0);
+    }
+
+    /** Map of core/system register name -> numeric value, from the Registers scope. */
+    private async readRegisterMap(session: vscode.DebugSession, frameId: number): Promise<Record<string, number>> {
+        const scopesResp = await session.customRequest('scopes', { frameId });
+        const regScope = (scopesResp?.scopes ?? []).find((s: any) => s.name === 'Registers');
+        const map: Record<string, number> = {};
+        if (!regScope) {
+            return map;
+        }
+        const varsResp = await session.customRequest('variables', { variablesReference: regScope.variablesReference });
+        for (const v of varsResp?.variables ?? []) {
+            const raw = String(v.value ?? '').trim();
+            const n = parseInt(raw, raw.toLowerCase().startsWith('0x') ? 16 : 10);
+            if (!Number.isNaN(n)) {
+                map[v.name.toLowerCase()] = n >>> 0;
+            }
+        }
+        return map;
+    }
+
+    /**
+     * Decode the current ARM Cortex-M fault and recover the pre-fault context.
+     * Core-aware: ARMv7-M (M3/M4/M7) and ARMv8-M Mainline (M33/M55/M85) decode
+     * CFSR/HFSR (+ STKOF and SecureFault on v8-M); ARMv6-M (M0/M0+) and ARMv8-M
+     * Baseline (M23) are HardFault-only (no fault-status registers) so the verdict
+     * comes from ICSR.VECTACTIVE + the stacked PC.
+     */
+    private async handleExplainFault(): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+
+        // Detect the core (CPUID PartNo bits[15:4]).
+        const cpuid = await this.readU32(session, 0xE000ED00);
+        const partno = (cpuid >> 4) & 0xfff;
+        const core = CORTEX_CORES[partno] ?? {
+            name: `unknown core (CPUID PartNo 0x${partno.toString(16)})`,
+            // Architecture field bits[19:16]: 0xF = v7-M/v8-M (has CFSR), 0xC = v6-M.
+            configurableFaults: ((cpuid >> 16) & 0xf) === 0xf,
+            v8m: false,
+        };
+
+        // Current exception (ICSR.VECTACTIVE bits[8:0]).
+        const icsr = await this.readU32(session, 0xE000ED04);
+        const vectActive = icsr & 0x1ff;
+        // Exception 7 is SecureFault only on ARMv8-M with Security; reserved elsewhere.
+        const namedException = (vectActive === 7 && !core.v8m) ? undefined : FAULT_EXCEPTIONS[vectActive];
+        const currentException = namedException
+            ?? (vectActive === 0 ? 'Thread mode' : `exception ${vectActive}`);
+        const inFaultHandler = vectActive >= 3 && vectActive <= 7;
+
+        const flags: string[] = [];
+        const add = (cond: number, name: string) => { if (cond) { flags.push(name); } };
+
+        // Configurable-fault status block (v7-M / v8-M Mainline only).
+        let cfsr = 0, hfsr = 0, dfsr = 0, shcsr = 0;
+        let mmarValid = false, bfarValid = false;
+        let mmfar: number | undefined, bfar: number | undefined;
+        if (core.configurableFaults) {
+            cfsr = await this.readU32(session, 0xE000ED28);
+            hfsr = await this.readU32(session, 0xE000ED2C);
+            dfsr = await this.readU32(session, 0xE000ED30);
+            shcsr = await this.readU32(session, 0xE000ED24);
+            const mmfsr = cfsr & 0xff;
+            const bfsr = (cfsr >> 8) & 0xff;
+            const ufsr = (cfsr >> 16) & 0xffff;
+            add(mmfsr & 0x01, 'MMFSR.IACCVIOL (instruction access violation)');
+            add(mmfsr & 0x02, 'MMFSR.DACCVIOL (data access violation)');
+            add(mmfsr & 0x08, 'MMFSR.MUNSTKERR (MemManage unstacking on exception return)');
+            add(mmfsr & 0x10, 'MMFSR.MSTKERR (MemManage stacking on exception entry)');
+            add(mmfsr & 0x20, 'MMFSR.MLSPERR (MemManage during lazy FP state save)');
+            add(bfsr & 0x01, 'BFSR.IBUSERR (instruction bus error)');
+            add(bfsr & 0x02, 'BFSR.PRECISERR (precise data bus error)');
+            add(bfsr & 0x04, 'BFSR.IMPRECISERR (imprecise data bus error)');
+            add(bfsr & 0x08, 'BFSR.UNSTKERR (bus fault on unstacking)');
+            add(bfsr & 0x10, 'BFSR.STKERR (bus fault on stacking)');
+            add(bfsr & 0x20, 'BFSR.LSPERR (bus fault during lazy FP state save)');
+            add(ufsr & 0x0001, 'UFSR.UNDEFINSTR (undefined instruction)');
+            add(ufsr & 0x0002, 'UFSR.INVSTATE (invalid EPSR/Thumb state)');
+            add(ufsr & 0x0004, 'UFSR.INVPC (invalid PC load via EXC_RETURN)');
+            add(ufsr & 0x0008, 'UFSR.NOCP (no coprocessor / FPU not enabled)');
+            if (core.v8m) {
+                add(ufsr & 0x0010, 'UFSR.STKOF (stack overflow — ARMv8-M; check MSPLIM/PSPLIM)');
+            }
+            add(ufsr & 0x0100, 'UFSR.UNALIGNED (unaligned access)');
+            add(ufsr & 0x0200, 'UFSR.DIVBYZERO (divide by zero)');
+            add(hfsr & 0x00000002, 'HFSR.VECTTBL (vector table read fault)');
+            add(hfsr & 0x40000000, 'HFSR.FORCED (escalated configurable fault — see CFSR bits)');
+            add(hfsr & 0x80000000, 'HFSR.DEBUGEVT (debug event)');
+            mmarValid = !!(mmfsr & 0x80);
+            bfarValid = !!(bfsr & 0x80);
+            mmfar = mmarValid ? await this.readU32(session, 0xE000ED34) : undefined;
+            bfar = bfarValid ? await this.readU32(session, 0xE000ED38) : undefined;
+        }
+
+        // SecureFault (ARMv8-M with the Security Extension). SFSR reads as 0 from a
+        // Non-secure context / without the Main Extension, so only decode if set.
+        let sfsr = 0, sfarValid = false;
+        let sfar: number | undefined;
+        if (core.v8m) {
+            sfsr = await this.readU32(session, 0xE000EDE4).catch(() => 0);
+            if (sfsr) {
+                add(sfsr & 0x01, 'SFSR.INVEP (invalid entry point)');
+                add(sfsr & 0x02, 'SFSR.INVIS (invalid integrity signature)');
+                add(sfsr & 0x04, 'SFSR.INVER (invalid exception return)');
+                add(sfsr & 0x08, 'SFSR.AUVIOL (attribution unit violation)');
+                add(sfsr & 0x10, 'SFSR.INVTRAN (invalid transition)');
+                add(sfsr & 0x20, 'SFSR.LSPERR (lazy FP preservation error)');
+                add(sfsr & 0x80, 'SFSR.LSERR (lazy state error)');
+                sfarValid = !!(sfsr & 0x40);
+                sfar = sfarValid ? await this.readU32(session, 0xE000EDE8).catch(() => undefined) : undefined;
+            }
+        }
+
+        const faultActive = inFaultHandler || cfsr !== 0 || hfsr !== 0 || sfsr !== 0;
+        if (!faultActive) {
+            const result: any = {
+                fault: false,
+                core: core.name,
+                currentException,
+                vectActive,
+                summary: core.configurableFaults
+                    ? `No active fault on ${core.name}: CFSR/HFSR are 0 and not in a fault handler — a "stopped: exception" here is benign (debug/step event or ISR entry).`
+                    : `No active fault on ${core.name}: not in a fault handler (VECTACTIVE=${vectActive}). This core is HardFault-only (no fault-status registers).`,
+            };
+            if (core.configurableFaults) {
+                Object.assign(result, { cfsr: hex32(cfsr), hfsr: hex32(hfsr), dfsr: hex32(dfsr), shcsr: hex32(shcsr) });
+            }
+            return result;
+        }
+
+        const ctx = await this.recoverStackedContext(session, core.v8m);
+
+        let summary: string;
+        if (!core.configurableFaults) {
+            summary = `${currentException} on ${core.name} (HardFault-only architecture — no fault-status registers; diagnose from the faulting PC).`;
+        } else {
+            summary = `${inFaultHandler ? currentException : 'Fault'} on ${core.name}: ${flags.join('; ') || 'no decoded sub-bits set'}.`;
+        }
+        if (mmarValid) { summary += ` MMFAR=${hex32(mmfar!)}.`; }
+        if (bfarValid) { summary += ` BFAR=${hex32(bfar!)}.`; }
+        if (sfarValid) { summary += ` SFAR=${hex32(sfar!)}.`; }
+        if (ctx.faultingPc) { summary += ` Faulting PC=${ctx.faultingPc}${ctx.sourceLine ? ' — ' + ctx.sourceLine : ''}.`; }
+        if (core.configurableFaults && ((cfsr >> 8) & 0x04)) {
+            summary += ' NOTE: imprecise bus fault — the faulting PC is approximate (write buffer not yet drained).';
+        }
+
+        const result: any = {
+            fault: true,
+            core: core.name,
+            currentException,
+            summary,
+            flags,
+            faultingContext: ctx,
+        };
+        if (core.configurableFaults) {
+            Object.assign(result, {
+                cfsr: hex32(cfsr), hfsr: hex32(hfsr), dfsr: hex32(dfsr), shcsr: hex32(shcsr),
+                mmfar: { valid: mmarValid, address: mmfar !== undefined ? hex32(mmfar) : null },
+                bfar: { valid: bfarValid, address: bfar !== undefined ? hex32(bfar) : null },
+            });
+        }
+        if (sfsr) {
+            result.sfsr = hex32(sfsr);
+            result.sfar = { valid: sfarValid, address: sfar !== undefined ? hex32(sfar) : null };
+        }
+        return result;
+    }
+
+    /**
+     * Recover the pre-fault context from the stacked exception frame. Uses the
+     * stopped thread's TOP (handler) frame so $lr is the live EXC_RETURN. Frame
+     * layout (R0,R1,R2,R3,R12,LR,PC,xPSR) is identical across ARMv6/7/8-M. On
+     * ARMv8-M with TrustZone, EXC_RETURN bit6 (S) selects the secure stack bank.
+     */
+    private async recoverStackedContext(session: vscode.DebugSession, v8m: boolean): Promise<any> {
+        const ctx: any = {};
+        try {
+            const threadId = await this.tracker.resolveActiveThreadId(session);
+            const stack = threadId !== undefined
+                ? await session.customRequest('stackTrace', { threadId, startFrame: 0, levels: 1 })
+                : undefined;
+            const topFrameId = stack?.stackFrames?.[0]?.id;
+            if (topFrameId === undefined) {
+                ctx.note = 'No stopped frame available.';
+                return ctx;
+            }
+            const regs = await this.readRegisterMap(session, topFrameId);
+            const lr = regs['lr'];
+            if (lr === undefined || (lr >>> 24) !== 0xff) {
+                ctx.note = '$lr is not an EXC_RETURN — not stopped in the fault handler? Pre-fault context unavailable.';
+                return ctx;
+            }
+            const useProcessStack = !!(lr & 0x4);  // EXC_RETURN bit 2 (SPSEL)
+            const basicFrame = !!(lr & 0x10);      // bit 4 (FType): 1 = basic (no FP), 0 = extended
+            const secure = v8m && !!(lr & 0x40);   // bit 6 (S): frame on the Secure stack
+            let sp: number | undefined;
+            if (secure) {
+                sp = useProcessStack ? (regs['psp_s'] ?? regs['psp']) : (regs['msp_s'] ?? regs['msp']);
+            } else {
+                sp = useProcessStack ? regs['psp'] : regs['msp'];
+            }
+            ctx.excReturn = hex32(lr);
+            ctx.stack = (useProcessStack ? 'PSP' : 'MSP') + (secure ? '_S' : '');
+            ctx.fpFrame = !basicFrame;
+            if (sp === undefined) {
+                ctx.note = `Could not read ${ctx.stack} to locate the stacked frame.`;
+                return ctx;
+            }
+            const resp = await session.customRequest('readMemory', { memoryReference: hex32(sp), offset: 0, count: 32 });
+            const f = resp?.data ? Buffer.from(resp.data, 'base64') : Buffer.alloc(0);
+            if (f.length < 32) {
+                ctx.note = 'Could not read the stacked exception frame.';
+                return ctx;
+            }
+            const stackedPc = f.readUInt32LE(24);
+            ctx.r0 = hex32(f.readUInt32LE(0));
+            ctx.r1 = hex32(f.readUInt32LE(4));
+            ctx.r2 = hex32(f.readUInt32LE(8));
+            ctx.r3 = hex32(f.readUInt32LE(12));
+            ctx.r12 = hex32(f.readUInt32LE(16));
+            ctx.faultingLr = hex32(f.readUInt32LE(20));
+            ctx.faultingPc = hex32(stackedPc);
+            ctx.xpsr = hex32(f.readUInt32LE(28));
+            try {
+                const info = await this.handleGdbExec({ command: `info line *${hex32(stackedPc)}` });
+                ctx.sourceLine = info.split('\n')[0];
+            } catch {
+                // best-effort source line
+            }
+        } catch (err: any) {
+            ctx.note = `Could not recover pre-fault context: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        return ctx;
     }
 
     /**

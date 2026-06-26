@@ -152,6 +152,13 @@ const writeMemoryDescription = `Write target memory on the SHARED debug session.
 string/decimal; 'data' is hex bytes (e.g. 'deadbeef' or 'de ad be ef'). DANGEROUS: mutates live target
 state — confirm intent and narrate to the human. Not all adapters support memory writes.`;
 
+const explainFaultDescription = `Decode the current ARM Cortex-M fault on the SHARED session. Auto-detects
+the core via CPUID. On ARMv7-M (M3/M4/M7) and ARMv8-M Mainline (M33/M55/M85): decodes CFSR/HFSR/MMFAR/BFAR
+(+ UFSR.STKOF stack-overflow and SecureFault SFSR/SFAR on v8-M) into plain English. On ARMv6-M (M0/M0+)
+and ARMv8-M Baseline (M23): HardFault-only — verdict from ICSR.VECTACTIVE + the stacked PC. Always recovers
+the PRE-FAULT context (faulting PC/LR/xPSR + R0-R3/R12) from the stacked exception frame via EXC_RETURN,
+with the source line. Returns {fault:false} for a benign 'exception' stop. Call while stopped in the handler.`;
+
 // Zod schemas for the tools
 const listFilesInputSchema = {
     type: "object",
@@ -341,6 +348,11 @@ const tools = [
             },
             required: ["address", "data"]
         },
+    },
+    {
+        name: "explain_fault",
+        description: explainFaultDescription,
+        inputSchema: { type: "object", properties: {} },
     },
 ];
 

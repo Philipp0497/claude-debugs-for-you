@@ -258,6 +258,46 @@ From a fresh Claude Code session in the firmware repo, **`/mcp` shows the `debug
 
 ---
 
+## Feature 1 (Phase 6) — `explain_fault` (multi-core) — READY TO TEST
+
+Decodes the current Cortex-M fault and recovers the **pre-fault** context (faulting PC/LR/xPSR + R0-R3/R12) from the stacked exception frame via EXC_RETURN, with the source line. The 15th tool. **Auto-detects the core via CPUID** and adapts:
+
+- **ARMv7-M (M3/M4/M7):** decodes CFSR/HFSR/MMFAR/BFAR bitfields into English.
+- **ARMv8-M Mainline (M33/M55/M85):** same + `UFSR.STKOF` (stack overflow → check MSPLIM/PSPLIM) + SecureFault `SFSR`/`SFAR`.
+- **ARMv6-M (M0/M0+) & ARMv8-M Baseline (M23):** HardFault-only — no fault-status registers, so the verdict comes from `ICSR.VECTACTIVE` + the stacked PC (the `cfsr==0 ⇒ no fault` logic would be *wrong* on these, so it's correctly bypassed).
+
+Every constant verified against the ARMv6-M / ARMv7-M / ARMv8-M ARMs. The stacked-frame recovery is common to all three.
+
+**Reload the dev host (Ctrl/Cmd+R)** first. If on stdio MCP, restart the Claude Code session so the tool loads (`/mcp`).
+
+### Test it
+
+```bash
+# 1. BENIGN case — at a normal breakpoint (no fault), expect {fault:false}:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"explain_fault","arguments":{}}'
+
+# 2. FORCE a real fault, then decode. One deterministic way — make the CPU
+#    execute from a bad address, then continue into the fault handler:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"gdb_exec","arguments":{"command":"set $pc = 0xfffffff0"}}'
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"debug","arguments":{"steps":[{"type":"continue"}]}}'
+# now stopped in HardFault/UsageFault handler:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"explain_fault","arguments":{}}'
+```
+
+(Use whatever fault trigger you prefer — a null-fn-pointer call, a bad store, etc. The `set $pc` trick is just the quickest deterministic one.)
+
+### The gate (Feature 1)
+
+`explain_fault` while stopped in the handler returns the decoded fault class + bitfields in English, the **faulting** PC/LR (the pre-fault context, not the handler), and the source line — **cross-checked** against a manual `gdb_exec "x/1xw 0xE000ED28"` (CFSR) and the stacked PC. The result includes `core` (auto-detected). And the benign case returns `{fault:false}` (subsuming the by-hand benign-exception check from Phase 3).
+
+**Per-core gating:** the F746 (M7) validates the common machinery + the ARMv7-M path now. The **M0+** path (HardFault-only verdict via VECTACTIVE; confirm it does *not* read CFSR and still reports the fault + faulting PC) and the **M33** path (`STKOF` on a forced stack overflow; `SecureFault`/`SFSR` if you run TrustZone) want their own boards when you're on them — same build, just point it at the target.
+
+---
+
 ## If you hit something
 
 Report: what you evaluated, what the tool returned, and what the VS Code panel showed for the same thread/frame. That, plus whether the `stopped` event had a `threadId`, pinpoints it fast.
