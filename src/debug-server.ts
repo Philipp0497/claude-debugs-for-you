@@ -161,20 +161,23 @@ const explainFaultInputSchema = {};
 const startSessionDescription = `Launch the debug session on the SHARED setup from a launch.json
 configuration (works with launch OR attach configs). REFUSES if a session is already active — use
 restart_session to relaunch. After launch the target typically halts at entry/main; the result reports
-whether it stopped. 'config' defaults to the first launch.json configuration. This is a VISIBLE action —
-VS Code shows the session starting.`;
+whether it stopped. 'config' defaults to the first launch.json configuration. Set runToMain:true to
+continue past the entry halt and stop at main(). This is a VISIBLE action — VS Code shows the session starting.`;
 
 const restartSessionDescription = `(Re)launch the debug session on the SHARED setup: stops any active
 session, then starts the named (or first) launch.json configuration. Use this to recover the session
 yourself after a destructive test (a forced fault, a reflash) instead of asking the human to reload VS
-Code. Reports whether the target halted at entry. 'config' defaults to the first launch.json configuration.`;
+Code. Reports whether the target halted at entry; set runToMain:true to continue on to main(). 'config'
+defaults to the first launch.json configuration.`;
 
 const startSessionInputSchema = {
     config: z.string().describe("launch.json configuration name (launch or attach); defaults to the first.").optional(),
+    runToMain: z.boolean().describe("After the entry halt, continue to main() and stop there (so you land on useful firmware, not Reset_Handler).").optional(),
 };
 
 const restartSessionInputSchema = {
     config: z.string().describe("launch.json configuration name (launch or attach); defaults to the first.").optional(),
+    runToMain: z.boolean().describe("After the entry halt, continue to main() and stop there (so you land on useful firmware, not Reset_Handler).").optional(),
 };
 
 // Standard ARM Cortex-M special/system registers to read when no specific name is
@@ -1462,7 +1465,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
      * refuses when one is already active; restart_session stops it first. Arms a
      * stop-waiter after any teardown so the run-to-entry halt is what resolves it.
      */
-    private async handleSessionLaunch(payload: { config?: string }, restart: boolean): Promise<any> {
+    private async handleSessionLaunch(payload: { config?: string; runToMain?: boolean }, restart: boolean): Promise<any> {
         const folder = vscode.workspace.workspaceFolders?.[0];
         if (!folder) {
             throw new Error('No workspace folder found');
@@ -1506,23 +1509,34 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         }
 
         // Wait for the NEW session (distinct from any we just stopped) to become active.
-        const session = await this.waitForNewSession(existing?.id, 8000);
+        let session = await this.waitForNewSession(existing?.id, 8000);
         if (!session) {
             throw new Error('Debug session did not become active after start');
         }
 
-        // Wait for the run-to-entry halt by polling the NEW session's tracked state.
-        // This is session-scoped, so the OLD session's terminate event cannot make us
-        // report "running" for a target that actually halted.
-        const stopDeadline = Date.now() + 20000;
-        while (
-            !this.tracker.getState(session.id)?.isStopped &&
-            vscode.debug.activeDebugSession?.id === session.id &&
-            Date.now() < stopDeadline
-        ) {
-            await new Promise((resolve) => setTimeout(resolve, 100));
+        // Wait for the target to reach a STABLE stop. awaitSettled ignores the
+        // transient reset-vector blink (which cortex-debug auto-resumes when
+        // runToEntryPoint is set) and tracks the LIVE session (a cold-flash restart
+        // can tear down + re-create the session on gdb reconnect). For runToMain it
+        // additionally waits for / drives to main(). Budget spans flash + reset + run.
+        let state;
+        let ranToMain: boolean | undefined;
+        if (payload?.runToMain) {
+            const mainSession = await this.awaitSettled(session, true, 30000);
+            ranToMain = !!mainSession;
+            if (mainSession) {
+                session = mainSession;
+            }
+            state = this.tracker.getState(session.id);
+        } else {
+            const settled = await this.awaitSettled(session, false, 25000);
+            if (settled) {
+                session = settled;
+            }
+            state = this.tracker.getState(session.id);
         }
-        const state = this.tracker.getState(session.id);
+
+        const location = state?.isStopped ? await this.topFrameLocation(session) : undefined;
 
         return {
             started: true,
@@ -1531,7 +1545,116 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             session: { id: session.id, type: session.type, name: session.name },
             status: state?.isStopped ? 'stopped' : 'running',
             reason: state?.reason,
+            ranToMain: payload?.runToMain ? !!ranToMain : undefined,
+            location,
         };
+    }
+
+    /**
+     * Poll until a LIVE debug session reaches a STABLE stop, up to timeoutMs.
+     *
+     * "Live" = the captured session while its tracked state exists, else the active
+     * session — so a restart/flash session swap or the old session's late terminate
+     * cannot abort the wait. "Stable" = isStopped held continuously for SETTLE_MS,
+     * which skips the transient reset-vector blink that cortex-debug auto-resumes
+     * when runToEntryPoint is set (and which otherwise reads as a stale/bare stop).
+     *
+     * requireMain: also require the top frame to be main(). If the target settles
+     * stably at a NON-main location (e.g. a config that halts at the entry and does
+     * NOT auto-advance), drive there once via tbreak+continue — but only because the
+     * target is genuinely stopped, so the continue never races a running target.
+     */
+    private async awaitSettled(captured: vscode.DebugSession, requireMain: boolean, timeoutMs: number): Promise<vscode.DebugSession | undefined> {
+        const SETTLE_MS = 400;
+        const deadline = Date.now() + timeoutMs;
+        let stoppedSince = 0;
+        let drivenToMain = false;
+        while (Date.now() < deadline) {
+            const sess = this.tracker.getState(captured.id) ? captured : vscode.debug.activeDebugSession;
+            const st = sess ? this.tracker.getState(sess.id) : undefined;
+            if (sess && st?.isStopped) {
+                if (!stoppedSince) {
+                    stoppedSince = Date.now();
+                }
+                if (Date.now() - stoppedSince >= SETTLE_MS) {
+                    if (!requireMain) {
+                        return sess;
+                    }
+                    if (/\bmain\b/.test(await this.topFrameName(sess))) {
+                        return sess;
+                    }
+                    // Stable at a non-main stop and we want main: drive there once.
+                    if (!drivenToMain) {
+                        drivenToMain = true;
+                        await this.driveToMain(sess);
+                        stoppedSince = 0; // it resumes, then settles at main
+                    }
+                }
+            } else {
+                stoppedSince = 0; // running — reset the stability timer
+            }
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        return undefined;
+    }
+
+    /** Top stack-frame name of a (stopped) session, or '' if unavailable. */
+    private async topFrameName(session: vscode.DebugSession): Promise<string> {
+        try {
+            const st = this.tracker.getState(session.id);
+            const tid = st?.stoppedThreadId ?? (await this.tracker.resolveActiveThreadId(session));
+            if (tid === undefined) {
+                return '';
+            }
+            const stk = await session.customRequest('stackTrace', { threadId: tid, startFrame: 0, levels: 1 });
+            return stk?.stackFrames?.[0]?.name ?? '';
+        } catch {
+            return '';
+        }
+    }
+
+    /** From a genuine stop, set a temp breakpoint at main() and continue toward it. */
+    private async driveToMain(session: vscode.DebugSession): Promise<void> {
+        try {
+            const out = await this.handleGdbExec({ command: 'tbreak main' });
+            if (/no symbol|not defined|no function|no source file/i.test(out)) {
+                return;
+            }
+            const threadId = await this.tracker.resolveActiveThreadId(session);
+            if (threadId === undefined) {
+                return;
+            }
+            this.tracker.markSelfActivity();
+            await session.customRequest('continue', { threadId });
+        } catch {
+            // e.g. "target is running" if it already auto-advanced — keep-waiting handles it
+        }
+    }
+
+    /** Top-frame location of a stopped session, retrying for the source-path lag. */
+    private async topFrameLocation(session: vscode.DebugSession): Promise<any> {
+        const st = this.tracker.getState(session.id);
+        const tid = st?.stoppedThreadId ?? (await this.tracker.resolveActiveThreadId(session));
+        if (tid === undefined) {
+            return undefined;
+        }
+        let best: any;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const stk = await session.customRequest('stackTrace', { threadId: tid, startFrame: 0, levels: 1 });
+                const top = stk?.stackFrames?.[0];
+                if (top) {
+                    best = { file: top.source?.path, line: top.line, function: top.name };
+                    if (top.source?.path) {
+                        break;
+                    }
+                }
+            } catch {
+                // retry
+            }
+            await new Promise((resolve) => setTimeout(resolve, 150));
+        }
+        return best;
     }
 
     /**

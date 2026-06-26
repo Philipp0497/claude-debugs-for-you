@@ -228,9 +228,13 @@ export class SessionStateTracker {
                 break;
             }
             case 'continued': {
-                // allThreadsContinued omitted or true => every thread resumed.
+                // allThreadsContinued omitted or true => every thread resumed. Also clear
+                // when we never knew which thread stopped (stoppedThreadId undefined — e.g.
+                // a bare reset-vector halt that cortex-debug auto-resumes for
+                // runToEntryPoint): any continue then means we are running again. Without
+                // this, isStopped latches stale on the transient halt.
                 const allContinued = body.allThreadsContinued !== false;
-                if (allContinued || body.threadId === state.stoppedThreadId) {
+                if (allContinued || state.stoppedThreadId === undefined || body.threadId === state.stoppedThreadId) {
                     this.markRunning(state);
                 }
                 break;

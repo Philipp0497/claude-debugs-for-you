@@ -162,12 +162,14 @@ with the source line. Returns {fault:false} for a benign 'exception' stop. Call 
 const startSessionDescription = `Launch the debug session on the SHARED setup from a launch.json
 configuration (works with launch OR attach configs). REFUSES if a session is already active — use
 restart_session to relaunch. After launch the target typically halts at entry/main; the result reports
-whether it stopped. 'config' defaults to the first launch.json configuration. This is a VISIBLE action.`;
+whether it stopped. 'config' defaults to the first launch.json configuration. Set runToMain:true to
+continue past the entry halt and stop at main(). This is a VISIBLE action.`;
 
 const restartSessionDescription = `(Re)launch the debug session on the SHARED setup: stops any active
 session, then starts the named (or first) launch.json configuration. Use this to recover the session
 yourself after a destructive test (a forced fault, a reflash) instead of asking the human to reload VS
-Code. Reports whether the target halted at entry. 'config' defaults to the first launch.json configuration.`;
+Code. Reports whether the target halted at entry; set runToMain:true to continue on to main(). 'config'
+defaults to the first launch.json configuration.`;
 
 // Zod schemas for the tools
 const listFilesInputSchema = {
@@ -370,7 +372,8 @@ const tools = [
         inputSchema: {
             type: "object",
             properties: {
-                config: { type: "string", description: "launch.json configuration name (launch or attach); defaults to the first." }
+                config: { type: "string", description: "launch.json configuration name (launch or attach); defaults to the first." },
+                runToMain: { type: "boolean", description: "After the entry halt, continue to main() and stop there." }
             }
         },
     },
@@ -380,7 +383,8 @@ const tools = [
         inputSchema: {
             type: "object",
             properties: {
-                config: { type: "string", description: "launch.json configuration name (launch or attach); defaults to the first." }
+                config: { type: "string", description: "launch.json configuration name (launch or attach); defaults to the first." },
+                runToMain: { type: "boolean", description: "After the entry halt, continue to main() and stop there." }
             }
         },
     },

@@ -322,6 +322,13 @@ curl -s localhost:3333/tcp -H 'content-type: application/json' \
 
 With no active session, `restart_session` brings the board up halted at entry and a subsequent `get_debug_state` shows `status: stopped` — **without you touching VS Code**. The real payoff test: force a fault (F1's `set $pc` trick) to kill the run, then call `restart_session` (no reload) → it tears down the faulted session and relaunches to a clean stopped-at-entry state. (`start_session` on an already-active session should refuse and point you to `restart_session`.)
 
+**`runToMain` refinement (test after a reload):** `restart_session {"runToMain": true}` should continue past the entry halt and land at `main()` — the result includes `ranToMain: true` and `location` at main, so a workflow lands on useful firmware in one call. (`tbreak main` → continue; if there's no `main` symbol it stays at entry with `ranToMain: false`.)
+
+```bash
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"restart_session","arguments":{"runToMain":true}}'
+```
+
 ---
 
 ## If you hit something
