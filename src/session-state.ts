@@ -120,6 +120,22 @@ export class SessionStateTracker {
     private stopWaiters: Array<(stopped: boolean) => void> = [];
 
     /**
+     * Thread the user/Claude explicitly selected for inspection (a TCB-pointer id
+     * under ThreadX). Overrides the stopped thread for inspection tools until the
+     * next resume. Cleared on continue/terminate.
+     */
+    private selectedThreadId: number | undefined;
+
+    /**
+     * Active console-output collector for `captureConsoleOutput` (gdb_exec). Only
+     * one capture runs at a time (serialized via captureQueue) because cortex-debug
+     * tags console OutputEvents with no command id — correlation is by timing, and
+     * the evaluate response is the end-of-output barrier.
+     */
+    private activeCapture: { console: string[]; stderr: string[] } | null = null;
+    private captureQueue: Promise<unknown> = Promise.resolve();
+
+    /**
      * Register the DebugAdapterTracker factory and session-lifecycle listeners.
      * Must be called from the extension host (it has `context`). The factory is
      * created once per session and observes the raw DAP traffic read-only.
@@ -226,6 +242,17 @@ export class SessionStateTracker {
                 this.settleStopWaiters(false);
                 break;
             }
+            case 'output': {
+                // Collect console/stderr text for an in-flight gdb_exec capture.
+                if (this.activeCapture) {
+                    if (body.category === 'console') {
+                        this.activeCapture.console.push(body.output ?? '');
+                    } else if (body.category === 'stderr') {
+                        this.activeCapture.stderr.push(body.output ?? '');
+                    }
+                }
+                break;
+            }
         }
     }
 
@@ -235,6 +262,8 @@ export class SessionStateTracker {
         state.reason = undefined;
         state.allThreadsStopped = undefined;
         state.selectedFrameId = undefined;
+        // A manual thread selection only applies within a single stop.
+        this.selectedThreadId = undefined;
     }
 
     /**
@@ -441,6 +470,67 @@ export class SessionStateTracker {
             threadId = resp?.threads?.[0]?.id;
         }
         return threadId;
+    }
+
+    /** Set (or clear) the explicitly selected thread for inspection tools. */
+    selectThread(threadId: number | undefined): void {
+        this.selectedThreadId = threadId;
+    }
+
+    getSelectedThreadId(): number | undefined {
+        return this.selectedThreadId;
+    }
+
+    /**
+     * Resolve which thread an inspection/forensics tool should operate on:
+     * explicit argument > selected thread > stopped thread > the sole thread.
+     * Returns undefined only if it cannot be determined unambiguously.
+     */
+    async resolveTargetThreadId(session: vscode.DebugSession, explicit?: number): Promise<number | undefined> {
+        if (explicit !== undefined) {
+            return explicit;
+        }
+        if (this.selectedThreadId !== undefined) {
+            // Re-validate against the live thread list: a ThreadX TCB-pointer id can
+            // become stale across a context switch (e.g. a step that re-stopped
+            // without a `continued` event, so markRunning never cleared it).
+            const resp = await session.customRequest('threads');
+            const ids: number[] = (resp?.threads ?? []).map((t: { id: number }) => t.id);
+            if (ids.includes(this.selectedThreadId)) {
+                return this.selectedThreadId;
+            }
+            this.selectedThreadId = undefined; // stale — drop and fall through
+        }
+        const state = this.states.get(session.id);
+        if (state?.isStopped && state.stoppedThreadId !== undefined) {
+            return state.stoppedThreadId;
+        }
+        const resp = await session.customRequest('threads');
+        const threads: Array<{ id: number }> = resp?.threads ?? [];
+        return threads.length === 1 ? threads[0].id : undefined;
+    }
+
+    /**
+     * Run `run()` (which should issue a repl `evaluate`) while collecting the
+     * console/stderr OutputEvents it produces, and return the captured text.
+     * Serialized so only one capture is active at a time. The evaluate response is
+     * the end-of-output barrier; a short tail drains any straggling output.
+     */
+    async captureConsoleOutput(run: () => Promise<void>, tailMs: number = 40): Promise<{ console: string; stderr: string }> {
+        const task = this.captureQueue.then(async () => {
+            const collector = { console: [] as string[], stderr: [] as string[] };
+            this.activeCapture = collector;
+            try {
+                await run();
+                await new Promise((resolve) => setTimeout(resolve, tailMs));
+            } finally {
+                this.activeCapture = null;
+            }
+            return { console: collector.console.join(''), stderr: collector.stderr.join('') };
+        });
+        // Keep the queue alive even if this capture throws.
+        this.captureQueue = task.catch(() => undefined);
+        return task;
     }
 }
 

@@ -175,6 +175,55 @@ These complete **Definition of Done #2** — Claude's breakpoints show in your g
 
 ---
 
+## Phase 4 — Cortex-M/GDB forensics — READY TO TEST
+
+Six new MCP tools for stack/register debugging on the shared session: `gdb_exec`, `read_special_reg`, `set_watchpoint`, `list_threads`, `select_thread`, `get_stack`. Designs verified against cortex-debug source; reviewed by three agents; fixes applied (attribution-in-queue, watchpoint success detection, stale-thread re-validation).
+
+**Reload the dev host (Ctrl/Cmd+R)** first. If you use the **stdio MCP** connection, also **restart the Claude Code session** (`/mcp` to confirm the 6 new tools) — stdio tools load at session start. Curl/`/tcp` works immediately after the dev-host reload.
+
+### Test it (curl) — stopped at a breakpoint
+
+```bash
+# Raw GDB CLI (output captured from the debug console):
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"gdb_exec","arguments":{"command":"info registers"}}'
+
+# Special registers (hex). $psplim/$msplim read back null on the F746 (Cortex-M7,
+# ARMv7-M) — that is CORRECT, not a bug; they exist only on the M33/STM32H5 (ARMv8-M).
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"read_special_reg","arguments":{}}'
+
+# Enumerate ThreadX threads (each with its top frame):
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"list_threads","arguments":{}}'
+
+# Pick a thread, then read ITS sp and walk ITS stack:
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"select_thread","arguments":{"threadId":<id from list_threads>}}'
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"read_special_reg","arguments":{"name":"sp"}}'
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"get_stack","arguments":{}}'
+
+# Write watchpoint on a global (then `continue` and watch it trip, reason "data breakpoint"):
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"set_watchpoint","arguments":{"expression":"<a global var>","kind":"write"}}'
+```
+
+### The Phase 4 acceptance gate (DoD #4)
+
+Confirm, all on the live session: **read the SP of a chosen ThreadX thread** (`select_thread` + `read_special_reg name:"sp"`), **set a write watchpoint** (`set_watchpoint`), and **report each thread's stack frame** (`list_threads` / `get_stack`). This is the forensics layer for the stack-overflow case (DoD #5).
+
+**`read_special_reg` output shape:** `{ threadId, currentThread, registers: {...}, note? }`.
+
+- `null` register = not present on this core (e.g. `$psplim`/`$msplim` on the M7 — expected; they have values on the STM32H5/M33), unknown convenience var (`$xpsr` reads `void`→`null`), or a global register on a non-current thread (see below).
+- **Non-current thread:** when you `select_thread` a thread other than the stopped one, the CPU-global hardware registers (`msp`/`psp`/`control`/`primask`/`basepri`/`faultmask`/`msplim`/`psplim`) come back `null` with a `note` — a single hardware instance only reflects the running context, so reporting them under another thread's name would be a silent wrong value. **`sp` is the per-thread authority** (reconstructed from the saved frame).
+- **`set_watchpoint`** accepts `expression` or the alias `expr`.
+
+**Environment caveat (not the MCP layer):** on this F746/OpenOCD setup, non-current ThreadX threads unwind to **garbage top frames** (`??@0x4`, `<signal handler called>`) — OpenOCD's ThreadX awareness mis-decodes the saved frame offset (doesn't detect the EXC_RETURN FPU-context bit). `info threads` via `gdb_exec` shows the same garbage, confirming it's the gdb-server. Only the **stopped thread** unwinds reliably; `list_threads`/`get_stack` top frames for *non-current* threads are unreliable on this target. `sp` per-thread is still correct.
+
+---
+
 ## If you hit something
 
 Report: what you evaluated, what the tool returned, and what the VS Code panel showed for the same thread/frame. That, plus whether the `stopped` event had a `threadId`, pinpoints it fast.

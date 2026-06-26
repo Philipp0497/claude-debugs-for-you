@@ -54,8 +54,72 @@ recent actions (each tagged human or claude). The session is SHARED with a human
 breakpoints, or change focus at any time — call this after any pause in your activity to re-sync before
 acting on a stale picture.`;
 
+const gdbExecDescription = `Run a raw GDB CLI command on the SHARED debug session and return its console
+output (cortex-debug). The escape hatch for anything not covered by a typed tool: 'info registers',
+'x/16xw $sp', 'bt', 'info threads', 'monitor reset halt', etc. Output is captured from the debug console
+(it is NOT returned in a normal evaluate result). Embedded double-quotes are not supported. For evaluating
+a program expression's value prefer the debug 'evaluate' step; this is for debugger/CLI commands.`;
+
+const readSpecialRegDescription = `Read ARM Cortex-M special/system registers on the SHARED session
+(frame-pinned, hex). Omit 'name' to read the standard M-profile set ($msp, $psp, $control, $primask,
+$basepri, $faultmask, plus $msplim/$psplim on ARMv8-M). Registers not present on the target read back as
+null. Defaults to the selected/stopped thread; pass threadId to target another.`;
+
+const setWatchpointDescription = `Set a hardware data watchpoint on the SHARED session via GDB
+(watch/rwatch/awatch). 'expression' may be a variable or an address cast, e.g. 'g_flag' or
+'*(uint32_t*)0x20000010'. kind: write (default), read, or access (both). Cortex-M has ~4 DWT comparators;
+exceeding them fails. A hit stops with reason 'data breakpoint'; re-read the expression to see the value.`;
+
+const listThreadsDescription = `List all threads on the SHARED session (one per RTOS/ThreadX thread when
+RTOS-aware), each with its top stack frame, and which is stopped/selected. Only meaningful while stopped.`;
+
+const selectThreadDescription = `Select a thread (id from list_threads) that the inspection/forensics tools
+(get_stack, read_special_reg) will default to, until the next resume. Does not switch the human's UI.`;
+
+const getStackDescription = `Get the call stack of a thread on the SHARED session (defaults to the
+selected/stopped thread; pass threadId for another). Use to walk each ThreadX thread's stack / assess
+stack usage.`;
+
 // Zod schemas for the tools
 const getDebugStateInputSchema = {};
+
+const gdbExecInputSchema = {
+    command: z.string().describe("Raw GDB CLI command, e.g. 'info registers', 'x/16xw $sp', 'bt', 'monitor reset halt'."),
+};
+
+const readSpecialRegInputSchema = {
+    name: z.string().describe("Register name without '$' (e.g. 'msp', 'psp', 'psplim', 'control'). Omit to read the standard set.").optional(),
+    threadId: z.number().describe("Thread to read from; defaults to the selected/stopped thread.").optional(),
+};
+
+const setWatchpointInputSchema = {
+    expression: z.string().describe("Expression or address to watch, e.g. 'g_counter' or '*(uint32_t*)0x20000010'.").optional(),
+    expr: z.string().describe("Alias for 'expression'.").optional(),
+    kind: z.enum(["write", "read", "access"]).describe("write (default), read, or access (both).").optional(),
+};
+
+const listThreadsInputSchema = {};
+
+const selectThreadInputSchema = {
+    threadId: z.number().describe("Thread id from list_threads."),
+};
+
+const getStackInputSchema = {
+    threadId: z.number().describe("Thread to get the stack for; defaults to the selected/stopped thread.").optional(),
+    levels: z.number().describe("Max number of frames (default 20).").optional(),
+};
+
+// Standard ARM Cortex-M special/system registers to read when no specific name is
+// given. msplim/psplim exist only on ARMv8-M (e.g. Cortex-M33); they read back as
+// null (unavailable) on ARMv7-M (e.g. Cortex-M7).
+const SPECIAL_REGS = ['sp', 'lr', 'pc', 'xpsr', 'msp', 'psp', 'primask', 'basepri', 'faultmask', 'control', 'msplim', 'psplim'];
+
+// CPU-global hardware registers: a single physical instance that reflects only the
+// CURRENT (running) context. For a NON-current thread these are meaningless (they
+// would report the running thread's values), so they are reported as null. By
+// contrast sp/lr/pc/xpsr are reconstructed from a thread's saved stack frame and
+// are per-thread (note: non-current unwinds depend on the gdb-server's RTOS support).
+const GLOBAL_ONLY_REGS = new Set(['msp', 'psp', 'control', 'primask', 'basepri', 'faultmask', 'msplim', 'psplim']);
 
 const listFilesInputSchema = {
     includePatterns: z.array(z.string()).describe("Glob patterns to include (e.g. ['**/*.js'])").optional(),
@@ -100,6 +164,36 @@ const tools = [
         description: getDebugStateDescription,
         inputSchema: getDebugStateInputSchema,
     },
+    {
+        name: "gdb_exec",
+        description: gdbExecDescription,
+        inputSchema: gdbExecInputSchema,
+    },
+    {
+        name: "read_special_reg",
+        description: readSpecialRegDescription,
+        inputSchema: readSpecialRegInputSchema,
+    },
+    {
+        name: "set_watchpoint",
+        description: setWatchpointDescription,
+        inputSchema: setWatchpointInputSchema,
+    },
+    {
+        name: "list_threads",
+        description: listThreadsDescription,
+        inputSchema: listThreadsInputSchema,
+    },
+    {
+        name: "select_thread",
+        description: selectThreadDescription,
+        inputSchema: selectThreadInputSchema,
+    },
+    {
+        name: "get_stack",
+        description: getStackDescription,
+        inputSchema: getStackInputSchema,
+    },
 ];
 export class DebugServer extends EventEmitter implements DebugServerEvents {
     private server: net.Server | null = null;
@@ -143,6 +237,36 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         this.mcpServer.tool("get_debug_state", getDebugStateDescription, getDebugStateInputSchema, async () => {
             const state = await this.handleGetDebugState();
             return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
+        });
+
+        this.mcpServer.tool("gdb_exec", gdbExecDescription, gdbExecInputSchema, async (args: any) => {
+            const out = await this.handleGdbExec(args);
+            return { content: [{ type: "text", text: out }] };
+        });
+
+        this.mcpServer.tool("read_special_reg", readSpecialRegDescription, readSpecialRegInputSchema, async (args: any) => {
+            const regs = await this.handleReadSpecialReg(args);
+            return { content: [{ type: "text", text: JSON.stringify(regs, null, 2) }] };
+        });
+
+        this.mcpServer.tool("set_watchpoint", setWatchpointDescription, setWatchpointInputSchema, async (args: any) => {
+            const result = await this.handleSetWatchpoint(args);
+            return { content: [{ type: "text", text: result }] };
+        });
+
+        this.mcpServer.tool("list_threads", listThreadsDescription, listThreadsInputSchema, async () => {
+            const threads = await this.handleListThreads();
+            return { content: [{ type: "text", text: JSON.stringify(threads, null, 2) }] };
+        });
+
+        this.mcpServer.tool("select_thread", selectThreadDescription, selectThreadInputSchema, async (args: any) => {
+            const result = await this.handleSelectThread(args);
+            return { content: [{ type: "text", text: result }] };
+        });
+
+        this.mcpServer.tool("get_stack", getStackDescription, getStackInputSchema, async (args: any) => {
+            const stack = await this.handleGetStack(args);
+            return { content: [{ type: "text", text: JSON.stringify(stack, null, 2) }] };
         });
     }
 
@@ -313,6 +437,18 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return await this.handleDebug(request.arguments);
             case 'get_debug_state':
                 return await this.handleGetDebugState();
+            case 'gdb_exec':
+                return await this.handleGdbExec(request.arguments);
+            case 'read_special_reg':
+                return await this.handleReadSpecialReg(request.arguments);
+            case 'set_watchpoint':
+                return await this.handleSetWatchpoint(request.arguments);
+            case 'list_threads':
+                return await this.handleListThreads();
+            case 'select_thread':
+                return await this.handleSelectThread(request.arguments);
+            case 'get_stack':
+                return await this.handleGetStack(request.arguments);
             default:
                 throw new Error(`Unknown tool: ${request.tool}`);
         }
@@ -530,6 +666,204 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             }
             return { type: 'other', enabled: bp.enabled };
         });
+    }
+
+    /**
+     * Resolve a {session, threadId, frameId} for a (possibly explicit/selected)
+     * target thread. When no thread is specified, defers to the full resolver
+     * (which also honors the human's focused frame); otherwise stackTraces the
+     * chosen thread and takes its top frame.
+     */
+    private async resolveFrameForThread(explicitThreadId?: number): Promise<{ session: vscode.DebugSession; threadId: number; frameId: number }> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        if (explicitThreadId === undefined && this.tracker.getSelectedThreadId() === undefined) {
+            return this.tracker.resolveActiveFrame();
+        }
+        const threadId = await this.tracker.resolveTargetThreadId(session, explicitThreadId);
+        if (threadId === undefined) {
+            throw new Error('Could not determine the target thread (specify threadId or select_thread)');
+        }
+        const stack = await session.customRequest('stackTrace', { threadId, startFrame: 0, levels: 1 });
+        const top = stack?.stackFrames?.[0];
+        if (!top) {
+            throw new Error(`No stack frames available for thread ${threadId}`);
+        }
+        return { session, threadId, frameId: top.id };
+    }
+
+    /** Run a raw GDB CLI command and return the captured console/stderr output. */
+    private async handleGdbExec(payload: { command: string }): Promise<string> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        const command = payload?.command;
+        if (!command || !command.trim()) {
+            throw new Error('command is required');
+        }
+
+        let rejectionMessage = '';
+        const { console: out, stderr } = await this.tracker.captureConsoleOutput(async () => {
+            // Mark self right before the send (NOT before the queue wait) so the repl
+            // evaluate is attributed to claude even if this capture queued behind
+            // others. Output arrives as console OutputEvents before the response.
+            this.tracker.markSelfActivity();
+            try {
+                await session.customRequest('evaluate', { expression: command, context: 'repl' });
+            } catch (err: any) {
+                // A failing command usually emits its error on the console/stderr stream
+                // (captured below); keep the rejection message in case it does not.
+                rejectionMessage = err instanceof Error ? err.message : String(err);
+            }
+        });
+
+        const parts = [out, stderr].filter((s) => s && s.trim());
+        if (parts.length === 0 && rejectionMessage) {
+            parts.push(rejectionMessage);
+        }
+        return parts.join('\n').trimEnd() || '(no output)';
+    }
+
+    /** Read ARM Cortex-M special/system registers (frame-pinned, hex). */
+    private async handleReadSpecialReg(payload: { name?: string; threadId?: number }): Promise<any> {
+        const { session, threadId, frameId } = await this.resolveFrameForThread(payload?.threadId);
+        const state = this.tracker.getState(session.id);
+        // The CPU's hardware registers reflect the running context = the stopped thread.
+        // Treat the target as "current" only when it IS that thread (conservative: if
+        // the stopped thread is unknown, assume non-current to avoid mislabeling).
+        const isCurrent = state?.stoppedThreadId !== undefined && threadId === state.stoppedThreadId;
+
+        const names = payload?.name
+            ? [payload.name.replace(/^\$/, '')]
+            : SPECIAL_REGS;
+
+        const registers: Record<string, string | null> = {};
+        for (const name of names) {
+            // Don't report the running thread's global registers under a non-current
+            // thread's name — that is a silent wrong value.
+            if (!isCurrent && GLOBAL_ONLY_REGS.has(name)) {
+                registers[name] = null;
+                continue;
+            }
+            try {
+                const response = await session.customRequest('evaluate', {
+                    expression: `$${name},x`,
+                    frameId,
+                    context: 'watch',
+                });
+                const raw: string = (response?.result ?? '').trim();
+                // null = not present on this target (GDB returns '<error>'/'<...>' or the
+                // literal 'void' for an unknown convenience register, e.g. $psplim on M7),
+                // or (for global regs above) not meaningful for a non-current thread.
+                registers[name] = !raw || raw === 'void' || raw.startsWith('<') ? null : raw;
+            } catch {
+                registers[name] = null;
+            }
+        }
+
+        const result: any = { threadId, currentThread: isCurrent, registers };
+        if (!isCurrent) {
+            result.note = 'Non-current thread: CPU-global registers (msp/psp/control/primask/basepri/faultmask/msplim/psplim) are null because a single hardware instance reflects only the running thread. sp is the per-thread stack pointer (reconstructed from the saved frame); lr/pc/xpsr are also per-thread but depend on the gdb-server\'s RTOS unwind fidelity.';
+        }
+        return result;
+    }
+
+    /** Set a hardware data watchpoint via GDB (watch/rwatch/awatch). */
+    private async handleSetWatchpoint(payload: { expression?: string; expr?: string; kind?: 'write' | 'read' | 'access' }): Promise<string> {
+        const expression = payload?.expression ?? payload?.expr;
+        if (!expression || !expression.trim()) {
+            throw new Error('expression is required');
+        }
+        const kind = payload.kind ?? 'write';
+        const verb = kind === 'read' ? 'rwatch' : kind === 'access' ? 'awatch' : 'watch';
+
+        const out = await this.handleGdbExec({ command: `${verb} ${expression}` });
+        // GDB confirms success with e.g. "Hardware watchpoint 3: <expr>",
+        // "Hardware read watchpoint 3: ...", "Hardware access (read/write) watchpoint 3: ...".
+        // Check for that FIRST so a watched symbol whose name contains "error"/"invalid"
+        // (e.g. g_error_flag) is not mis-reported as a failure.
+        const succeeded = /watchpoint\s+\d+:/i.test(out);
+        const failed = !succeeded && /no symbol .* in current context|cannot|can not|free dwt|no hardware|too many|expression cannot/i.test(out);
+        if (failed) {
+            return `Watchpoint may have failed (Cortex-M has ~4 DWT comparators): ${out}`;
+        }
+        return `Set ${kind} watchpoint on ${expression}\n${out}`;
+    }
+
+    /** List all threads with their top frame, and which is stopped/selected. */
+    private async handleListThreads(): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        const state = this.tracker.getState(session.id);
+        const selected = this.tracker.getSelectedThreadId();
+        const resp = await session.customRequest('threads');
+        const threads: Array<{ id: number; name: string }> = resp?.threads ?? [];
+
+        const result: any[] = [];
+        for (const t of threads) {
+            const entry: any = {
+                id: t.id,
+                name: t.name,
+                stopped: t.id === state?.stoppedThreadId,
+                selected: t.id === selected,
+            };
+            try {
+                const stack = await session.customRequest('stackTrace', { threadId: t.id, startFrame: 0, levels: 1 });
+                const top = stack?.stackFrames?.[0];
+                if (top) {
+                    entry.topFrame = { file: top.source?.path, line: top.line, function: top.name };
+                }
+            } catch {
+                // per-thread stack may be unavailable; leave topFrame absent
+            }
+            result.push(entry);
+        }
+        return result;
+    }
+
+    /** Select a thread that inspection tools default to (until the next resume). */
+    private async handleSelectThread(payload: { threadId: number }): Promise<string> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        if (typeof payload?.threadId !== 'number') {
+            throw new Error('threadId (number) is required');
+        }
+        const resp = await session.customRequest('threads');
+        const threads: Array<{ id: number; name: string }> = resp?.threads ?? [];
+        const match = threads.find((t) => t.id === payload.threadId);
+        if (!match) {
+            throw new Error(`No thread with id ${payload.threadId}. Use list_threads to see valid ids.`);
+        }
+        this.tracker.selectThread(payload.threadId);
+        return `Selected thread ${payload.threadId} (${match.name}). Inspection tools default to it until the next resume.`;
+    }
+
+    /** Get the call stack of a thread (defaults to the selected/stopped thread). */
+    private async handleGetStack(payload: { threadId?: number; levels?: number }): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        const threadId = await this.tracker.resolveTargetThreadId(session, payload?.threadId);
+        if (threadId === undefined) {
+            throw new Error('Could not determine the target thread (specify threadId or select_thread)');
+        }
+        const levels = payload?.levels ?? 20;
+        const stack = await session.customRequest('stackTrace', { threadId, startFrame: 0, levels });
+        const frames = (stack?.stackFrames ?? []).map((f: any) => ({
+            id: f.id,
+            name: f.name,
+            file: f.source?.path,
+            line: f.line,
+        }));
+        return { threadId, frames };
     }
 
     /**

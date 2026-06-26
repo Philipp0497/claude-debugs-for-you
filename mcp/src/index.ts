@@ -108,6 +108,32 @@ recent actions (each tagged human or claude). The session is SHARED with a human
 breakpoints, or change focus at any time — call this after any pause in your activity to re-sync before
 acting on a stale picture.`;
 
+const gdbExecDescription = `Run a raw GDB CLI command on the SHARED debug session and return its console
+output (cortex-debug). The escape hatch for anything not covered by a typed tool: 'info registers',
+'x/16xw $sp', 'bt', 'info threads', 'monitor reset halt', etc. Output is captured from the debug console
+(it is NOT returned in a normal evaluate result). Embedded double-quotes are not supported. For evaluating
+a program expression's value prefer the debug 'evaluate' step; this is for debugger/CLI commands.`;
+
+const readSpecialRegDescription = `Read ARM Cortex-M special/system registers on the SHARED session
+(frame-pinned, hex). Omit 'name' to read the standard M-profile set ($msp, $psp, $control, $primask,
+$basepri, $faultmask, plus $msplim/$psplim on ARMv8-M). Registers not present on the target read back as
+null. Defaults to the selected/stopped thread; pass threadId to target another.`;
+
+const setWatchpointDescription = `Set a hardware data watchpoint on the SHARED session via GDB
+(watch/rwatch/awatch). 'expression' may be a variable or an address cast, e.g. 'g_flag' or
+'*(uint32_t*)0x20000010'. kind: write (default), read, or access (both). Cortex-M has ~4 DWT comparators;
+exceeding them fails. A hit stops with reason 'data breakpoint'; re-read the expression to see the value.`;
+
+const listThreadsDescription = `List all threads on the SHARED session (one per RTOS/ThreadX thread when
+RTOS-aware), each with its top stack frame, and which is stopped/selected. Only meaningful while stopped.`;
+
+const selectThreadDescription = `Select a thread (id from list_threads) that the inspection/forensics tools
+(get_stack, read_special_reg) will default to, until the next resume. Does not switch the human's UI.`;
+
+const getStackDescription = `Get the call stack of a thread on the SHARED session (defaults to the
+selected/stopped thread; pass threadId for another). Use to walk each ThreadX thread's stack / assess
+stack usage.`;
+
 // Zod schemas for the tools
 const listFilesInputSchema = {
     type: "object",
@@ -191,6 +217,67 @@ const tools = [
         description: getDebugStateDescription,
         inputSchema: { type: "object", properties: {} },
     },
+    {
+        name: "gdb_exec",
+        description: gdbExecDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                command: { type: "string", description: "Raw GDB CLI command, e.g. 'info registers', 'x/16xw $sp', 'bt', 'monitor reset halt'." }
+            },
+            required: ["command"]
+        },
+    },
+    {
+        name: "read_special_reg",
+        description: readSpecialRegDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                name: { type: "string", description: "Register name without '$' (e.g. 'msp', 'psp', 'psplim', 'control'). Omit to read the standard set." },
+                threadId: { type: "number", description: "Thread to read from; defaults to the selected/stopped thread." }
+            }
+        },
+    },
+    {
+        name: "set_watchpoint",
+        description: setWatchpointDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                expression: { type: "string", description: "Expression or address to watch, e.g. 'g_counter' or '*(uint32_t*)0x20000010'." },
+                expr: { type: "string", description: "Alias for 'expression'." },
+                kind: { type: "string", enum: ["write", "read", "access"], description: "write (default), read, or access (both)." }
+            }
+        },
+    },
+    {
+        name: "list_threads",
+        description: listThreadsDescription,
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "select_thread",
+        description: selectThreadDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                threadId: { type: "number", description: "Thread id from list_threads." }
+            },
+            required: ["threadId"]
+        },
+    },
+    {
+        name: "get_stack",
+        description: getStackDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                threadId: { type: "number", description: "Thread to get the stack for; defaults to the selected/stopped thread." },
+                levels: { type: "number", description: "Max number of frames (default 20)." }
+            }
+        },
+    },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -205,12 +292,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     });
 
     let text: string;
-    if (Array.isArray(response)) {
+    if (Array.isArray(response) && response.every((x) => typeof x === "string")) {
+        // String arrays (debug step results, listFiles) join as lines.
         text = response.join("\n");
     } else if (typeof response === "string") {
         text = response;
     } else {
-        // Structured tool results (e.g. get_debug_state) come back as objects.
+        // Structured tool results (get_debug_state, list_threads, get_stack,
+        // read_special_reg) come back as objects/arrays-of-objects.
         text = JSON.stringify(response, null, 2);
     }
 
