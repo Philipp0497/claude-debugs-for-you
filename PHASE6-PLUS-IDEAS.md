@@ -1,10 +1,10 @@
 # Phase 6+ — Ideas Backlog
 
-**Status:** brainstorm, not yet scoped. Phases 1–5 are done and HW-validated (relay, shared
-awareness, visible driving, forensics, streamable-HTTP). This is the candidate list for what
-comes next, ordered by leverage. Each item has a one-line *why*, a *gate* (definition-of-done,
-same rhythm as Phases 1–5: confirm on the live STM32+ThreadX board), and an *impl sketch*
-against the real source.
+**Status:** Phases 1–5 done & HW-validated. **Feature 1 (`explain_fault`) DONE** (commit 713f409,
+core-aware M0+/M7/M33; M7 HW-confirmed, M0+/M33 await silicon). **Feature 2 (session lifecycle) DONE**
+(commit a33ed00, HW-confirmed — recovered a faulted session, no VS Code touch). Remaining items below,
+ordered by leverage. Each has a one-line *why*, a *gate* (confirm on the live STM32+ThreadX board), and
+an *impl sketch* against the real source.
 
 Validated target for all gates: Nucleo-F746ZG (Cortex-M7F), ThreadX + NetX Duo, cortex-debug +
 OpenOCD + arm-none-eabi-gdb, MCP over `http://localhost:3333/mcp` (+ `/tcp` + `/sse` + stdio).
@@ -78,6 +78,13 @@ touching VS Code.
 - Track the launched session via the existing `SessionStateTracker` (`session-state.ts`).
 - Guard: refuse if a session is already live; expose the config name as an arg.
 - Stretch: `flash` (load the ELF) as a separate verb if the workflow wants reflash-then-debug.
+
+**DONE** (commit a33ed00): `start_session`/`restart_session`. HW-confirmed: recovered a session dead in
+MemManage_Handler to stopped-at-entry, no VS Code touch; race-hardened (session-scoped stop detection +
+waitForNewSession(excludeId)).
+**Follow-up refinement:** recovers to entry (Reset_Handler), not main. Add a `runToMain?: true` option
+(tbreak main → continue → wait for the main stop) so a workflow can resume *useful* firmware in one call
+instead of entry + a manual continue/breakpoint.
 
 ---
 
