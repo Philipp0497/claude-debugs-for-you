@@ -12,6 +12,7 @@ interface DebugServerEvents {
 }
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { SessionStateTracker } from './session-state';
 
 export interface DebugCommand {
     command: 'listFiles' | 'getFileContent' | 'debug';
@@ -57,7 +58,7 @@ const debugStepSchema = z.object({
     type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch"]).describe(""),
     file: z.string(),
     line: z.number().optional(),
-    expression: z.string().describe("An expression to be evaluated in the stack frame of the current breakpoint").optional(),
+    expression: z.string().describe("A bare expression to evaluate in the resolved stopped frame (e.g. a variable name, '&symbol', '$pc', '$sp'). NOT a debugger CLI command: 'p/x ...', 'info registers', 'x/...', 'monitor ...' are not supported here. For hex output append a ',x' format suffix (e.g. 'value,x').").optional(),
     condition: z.string().describe("If needed, a breakpoint condition may be specified to only stop on a breakpoint for some given condition.").optional(),
 });
 
@@ -90,11 +91,17 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
     private activeTransports: Record<string, SSEServerTransport> = {};
     private mcpServer: McpServer;
     private _isRunning: boolean = false;
+    private tracker: SessionStateTracker;
 
-    constructor(port?: number, portConfigPath?: string) {
+    constructor(port: number | undefined, portConfigPath: string | undefined, tracker: SessionStateTracker) {
         super();
         this.port = port || 4711;
         this.portConfigPath = portConfigPath || null;
+        // The tracker is the single source of truth for "where the session is".
+        // It is mandatory and must already be register()-ed by the extension host;
+        // an unregistered tracker would have an empty state map and silently
+        // degrade resolution back to the wrong-thread bug this fork removes.
+        this.tracker = tracker;
         this.mcpServer = new McpServer({
             name: "Debug Server",
             version: "1.0.0",
@@ -338,10 +345,15 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
 
         // Check if we're at a breakpoint
         try {
-            const threads = await session.customRequest('threads');
-            const threadId = threads?.threads?.[0]?.id;
+            // Resolve the stopped thread from session state (never hardcode/assume
+            // threads[0]). Right after launch the target may not be stopped yet, or
+            // the RTOS scheduler may not have started, so tolerate "no thread".
+            const threadId = await this.tracker.resolveActiveThreadId(session);
+            if (threadId === undefined) {
+                return 'Debug session started';
+            }
 
-            const stack = await session.customRequest('stackTrace', { threadId });
+            const stack = await session.customRequest('stackTrace', { threadId, startFrame: 0, levels: 1 });
             if (stack.stackFrames && stack.stackFrames.length > 0) {
                 const topFrame = stack.stackFrames[0];
                 const currentBreakpoints = vscode.debug.breakpoints.filter(bp => {
@@ -462,50 +474,48 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         throw new Error('No active debug session');
                     }
 
-                    // Get the current thread ID (required by DAP spec)
-                    const threads = await session.customRequest('threads');
-                    const threadId = threads.threads[0].id;
+                    // Continue the thread that is actually stopped (resolved from the
+                    // `stopped` event), not threads[0]. On an all-stop Cortex-M target
+                    // this resumes the core; allThreadsContinued typically comes back true.
+                    const threadId = await this.tracker.resolveActiveThreadId(session);
+                    if (threadId === undefined) {
+                        throw new Error('No threads available to continue');
+                    }
 
-                    // Continue with the thread ID
                     await session.customRequest('continue', { threadId });
                     results.push('Continued execution');
                     break;
                 }
 
                 case 'evaluate': {
-                    const session = vscode.debug.activeDebugSession;
-                    if (!session) {
-                        throw new Error('No active debug session');
-                    }
-
-                    const activeStackItem = vscode.debug.activeStackItem;
-
-                    // Grab the active frameId
-                    let frameId = undefined;
-                    if (activeStackItem instanceof vscode.DebugStackFrame) {
-                        frameId = activeStackItem.frameId;
-                    }
-
-                    // In case activeStackItem.frameId is falsey
-                    if (!frameId) {
-                        // Get the current stack frame
-                        const frames = await session.customRequest('stackTrace', {
-                            threadId: 1  // You might need to get the actual threadId
-                        });
-
-                        if (!frames || !frames.stackFrames || frames.stackFrames.length === 0) {
-                            vscode.window.showErrorMessage('No stack frame available');
-                            break;
-                        }
-
-                        frameId = frames.stackFrames[0].id;  // Usually use the top frame
+                    // Resolve the correct stopped thread + frame from session state.
+                    // This replaces the old hardcoded `threadId: 1`, which broke under
+                    // multi-thread (RTOS) targets where the stopped thread is rarely id 1.
+                    let session: vscode.DebugSession;
+                    let frameId: number;
+                    try {
+                        ({ session, frameId } = await this.tracker.resolveActiveFrame());
+                    } catch (err: any) {
+                        results.push(`ERROR: Could not resolve a stopped frame for "${step.expression}": ${err instanceof Error ? err.message : String(err)}`);
+                        break;
                     }
 
                     try {
+                        // Use 'watch' context, NOT 'repl'. cortex-debug's repl path runs
+                        // the input as `interpreter-exec console`, emits the value to the
+                        // Debug Console as an OutputEvent, and returns a valueless serialized
+                        // node in response.result (the "relay bug") — and it ignores frameId.
+                        // The 'watch' path evaluates the expression via a var-object, returns
+                        // the value in response.result, and honors frameId (frame-pinned to
+                        // the resolved RTOS thread/frame). It is also the portable DAP context
+                        // (debugpy etc.). Trade-off: GDB CLI verbs ('p/x', 'info registers',
+                        // 'x/...', 'monitor ...') are NOT valid here — those move to the
+                        // Phase 4 gdb_exec tool (repl + OutputEvent capture). Use bare
+                        // expressions; for hex, append a ',x' format suffix.
                         const response = await session.customRequest('evaluate', {
                             expression: step.expression,
                             frameId: frameId,
-                            context: 'repl'
+                            context: 'watch'
                         });
 
                         results.push(`Evaluated "${step.expression}": ${response.result}`);

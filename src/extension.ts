@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { DebugServer } from './debug-server';
+import { SessionStateTracker } from './session-state';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -30,7 +31,12 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.window.showErrorMessage(`Failed to write port configuration: ${err.message}`);
     }
 
-    const server = new DebugServer(port, portConfigPath);
+    // Track live debug-session state (the stopped thread/frame) from DAP events.
+    // Registered before the server so the first `stopped` event is rarely missed.
+    const sessionTracker = new SessionStateTracker();
+    sessionTracker.register(context);
+
+    const server = new DebugServer(port, portConfigPath, sessionTracker);
 
     // Create status bar item
     const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right);

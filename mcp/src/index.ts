@@ -140,7 +140,7 @@ const debugStepSchema = {
             file: { type: "string" },
             line: { type: "number" },
             expression: {
-                description: "An expression to be evaluated in the stack frame of the current breakpoint",
+                description: "A bare expression to evaluate in the resolved stopped frame (e.g. a variable name, '&symbol', '$pc', '$sp'). NOT a debugger CLI command: 'p/x ...', 'info registers', 'x/...', 'monitor ...' are not supported here. For hex output append a ',x' format suffix (e.g. 'value,x').",
                 type: "string"
             },
             condition: {
