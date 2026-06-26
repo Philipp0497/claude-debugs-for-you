@@ -3,8 +3,9 @@
 **Status:** Phases 1–5 done & HW-validated. **Feature 1 (`explain_fault`) DONE** (commit 713f409,
 core-aware M0+/M7/M33; M7 HW-confirmed, M0+/M33 await silicon). **Feature 2 (session lifecycle) DONE**
 (commit a33ed00, HW-confirmed — recovered a faulted session, no VS Code touch). **Feature 4 (ThreadX TCB
-introspection) DONE** (commit 878be01, HW-confirmed — retired both open findings #2 + ENV). Remaining
-items below, ordered by leverage. Each has a one-line *why*, a *gate* (confirm on the live STM32+ThreadX board), and
+introspection) DONE** (commit 878be01, HW-confirmed — retired both open findings #2 + ENV). **Feature 3
+(read_peripheral / SVD decode) DONE** (commit ca1628f, HW-confirmed). 20 tools total. Remaining items
+below, ordered by leverage. Each has a one-line *why*, a *gate* (confirm on the live STM32+ThreadX board), and
 an *impl sketch* against the real source.
 
 Validated target for all gates: Nucleo-F746ZG (Cortex-M7F), ThreadX + NetX Duo, cortex-debug +
@@ -93,7 +94,13 @@ fight the auto-drive, plus a tracker fix clearing isStopped on the bare reset ha
 
 ## Strong candidates
 
-### Feature 3 — SVD / peripheral register decode  `read_peripheral`
+### Feature 3 — SVD / peripheral register decode  `read_peripheral`  — DONE (commit ca1628f) ✅
+
+**DONE / HW-confirmed:** `read_peripheral "ETH.MACCR"` decodes the bitfields and matches the raw
+`read_memory 0x40028000`. `src/svd.ts` parses the launch.json `svdFile` (derivedFrom, 3 field encodings,
+BigInt 32-bit fields); resolves by exact name then prefix/group (no `ETH` peripheral → Ethernet_MAC/MMC/
+PTP/DMA). Parser validated offline against the real STM32F746.svd. Note: there's no single "RX total"
+register — use `Ethernet_MMC.MMCRGUFCR` (received good unicast) as the RX oracle.
 
 **Why:** decode `ETH`/`RCC`/`USART`/DMA by name with bitfields instead of raw `*(u32*)0x…`. Directly
 serves the MAC/PHY bring-up work (MMC RX/TX counters as the "is RX alive" oracle, MACCR, etc.).
