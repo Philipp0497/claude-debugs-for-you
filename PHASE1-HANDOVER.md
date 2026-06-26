@@ -224,6 +224,40 @@ Confirm, all on the live session: **read the SP of a chosen ThreadX thread** (`s
 
 ---
 
+## Phase 5 — Consolidation + streamable-HTTP transport — READY TO TEST
+
+**Additive surface:** four new inspection tools — `get_registers` (core registers via the Registers scope), `get_variables` (locals/globals/statics by scope), `read_memory` (hex dump), `write_memory` (hex bytes — DANGEROUS, mutates live state). The `debug` batch tool and all earlier tools are kept.
+
+**Transport:** a streamable-HTTP endpoint at **`http://localhost:4711/mcp`** (Claude Code's preferred channel), alongside the existing stdio + SSE. The MCP SDK was upgraded 1.5.0 → ^1.13.0. The full handshake (initialize → session → tools/list → tools/call → terminate) is validated, including per-session cleanup (no transport leak).
+
+**Reload the dev host (Ctrl/Cmd+R)** first.
+
+### Connect Claude Code over HTTP (in your firmware repo)
+
+```bash
+# status-bar menu → "Copy MCP HTTP address"  → http://localhost:4711/mcp
+claude mcp add --transport http debug http://localhost:4711/mcp --scope project
+```
+
+Then **restart the Claude Code session** and run `/mcp` — the `debug` server should show **connected** with the full tool set (listFiles, getFileContent, debug, get_debug_state, gdb_exec, read_special_reg, set_watchpoint, list_threads, select_thread, get_stack, get_registers, get_variables, read_memory, write_memory). The extension must be running (status-bar ✓). stdio (`claude mcp add --transport stdio ...`) and SSE remain available as fallbacks.
+
+### Quick tool checks (curl, stopped at a breakpoint)
+
+```bash
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"get_registers","arguments":{}}'         # r0-r15, sp, lr, pc, xPSR
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"get_variables","arguments":{}}'         # locals by scope
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"read_memory","arguments":{"address":"0x20000000","count":32}}'
+```
+
+### The Phase 5 acceptance gate
+
+From a fresh Claude Code session in the firmware repo, **`/mcp` shows the `debug` server connected over HTTP and the tools available**, and the new inspection tools return correct data on the live session. That closes out the plan — Phases 1–5 done; **DoD #5** (full human↔Claude handoff on the live STM32 session, no re-attach, no lost context) is now end-to-end.
+
+---
+
 ## If you hit something
 
 Report: what you evaluated, what the tool returned, and what the VS Code panel showed for the same thread/frame. That, plus whether the `stopped` event had a `threadId`, pinpoints it fast.

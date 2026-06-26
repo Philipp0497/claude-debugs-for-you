@@ -191,6 +191,7 @@ export function activate(context: vscode.ExtensionContext) {
                 { label: `Set Port (currently: ${currentPort})`, command: 'vscode-mcp-debug.setPort' },
                 { label: `${updatedConfig.get<boolean>('autostart') ? 'Disable' : 'Enable'} Autostart`, command: 'vscode-mcp-debug.toggleAutostart' },
                 { label: "Copy stdio path", command: 'vscode-mcp-debug.copyStdioPath' },
+                { label: "Copy MCP HTTP address", command: 'vscode-mcp-debug.copyHttpAddress' },
                 { label: "Copy SSE address", command: 'vscode-mcp-debug.copySseAddress' }
             ];
 
@@ -223,6 +224,13 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('vscode-mcp-debug.copyStdioPath', async () => {
             await vscode.env.clipboard.writeText(mcpServerPath);
             vscode.window.showInformationMessage(`MCP stdio server path copied to clipboard.`);
+        }),
+        vscode.commands.registerCommand('vscode-mcp-debug.copyHttpAddress', async () => {
+            // Always get the latest port from config
+            const updatedConfig = vscode.workspace.getConfiguration('mcpDebug');
+            const currentPort = updatedConfig.get<number>('port') ?? 4711;
+            await vscode.env.clipboard.writeText(`http://localhost:${currentPort}/mcp`);
+            vscode.window.showInformationMessage(`MCP streamable-HTTP address copied to clipboard.`);
         }),
         vscode.commands.registerCommand('vscode-mcp-debug.copySseAddress', async () => {
             // Always get the latest port from config

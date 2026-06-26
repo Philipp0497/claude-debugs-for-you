@@ -134,6 +134,24 @@ const getStackDescription = `Get the call stack of a thread on the SHARED sessio
 selected/stopped thread; pass threadId for another). Use to walk each ThreadX thread's stack / assess
 stack usage.`;
 
+const getRegistersDescription = `Read the CPU core registers (r0-r15, sp, lr, pc, xPSR, ...) of a thread on
+the SHARED debug session via the 'Registers' scope, frame-pinned to the selected/stopped thread. For
+M-profile special/system registers ($msp/$psp/$control/...) use read_special_reg. The session is shared —
+re-check get_debug_state if the human may have acted since your last call.`;
+
+const getVariablesDescription = `Read in-scope variables (locals, and globals/statics) of a thread's
+current frame on the SHARED debug session, grouped by scope, frame-pinned to the selected/stopped thread.
+A non-zero variablesReference marks an expandable structure. Re-check get_debug_state if the human may
+have acted since your last call.`;
+
+const readMemoryDescription = `Read target memory on the SHARED debug session. 'address' is a hex string or
+decimal (e.g. '0x20000000'); returns 'count' bytes (default 64) as hex. Invisible read — narrate the
+result to the human.`;
+
+const writeMemoryDescription = `Write target memory on the SHARED debug session. 'address' is a hex
+string/decimal; 'data' is hex bytes (e.g. 'deadbeef' or 'de ad be ef'). DANGEROUS: mutates live target
+state — confirm intent and narrate to the human. Not all adapters support memory writes.`;
+
 // Zod schemas for the tools
 const listFilesInputSchema = {
     type: "object",
@@ -276,6 +294,52 @@ const tools = [
                 threadId: { type: "number", description: "Thread to get the stack for; defaults to the selected/stopped thread." },
                 levels: { type: "number", description: "Max number of frames (default 20)." }
             }
+        },
+    },
+    {
+        name: "get_registers",
+        description: getRegistersDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                threadId: { type: "number", description: "Thread to read from; defaults to the selected/stopped thread." }
+            }
+        },
+    },
+    {
+        name: "get_variables",
+        description: getVariablesDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                threadId: { type: "number", description: "Thread to read from; defaults to the selected/stopped thread." },
+                scope: { type: "string", description: "Only return this scope (e.g. 'Local'). Omit for all non-register scopes." }
+            }
+        },
+    },
+    {
+        name: "read_memory",
+        description: readMemoryDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                address: { type: "string", description: "Address as a hex string or decimal, e.g. '0x20000000'." },
+                count: { type: "number", description: "Number of bytes to read (default 64)." },
+                offset: { type: "number", description: "Byte offset from address (default 0)." }
+            },
+            required: ["address"]
+        },
+    },
+    {
+        name: "write_memory",
+        description: writeMemoryDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                address: { type: "string", description: "Address as a hex string or decimal, e.g. '0x20000000'." },
+                data: { type: "string", description: "Hex bytes to write, e.g. 'deadbeef' or 'de ad be ef'." }
+            },
+            required: ["address", "data"]
         },
     },
 ];

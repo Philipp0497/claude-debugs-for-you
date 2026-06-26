@@ -10,8 +10,10 @@ interface DebugServerEvents {
     emit(event: 'started'): boolean;
     emit(event: 'stopped'): boolean;
 }
+import { randomUUID } from 'crypto';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { SessionStateTracker } from './session-state';
 
 export interface DebugCommand {
@@ -109,6 +111,44 @@ const getStackInputSchema = {
     levels: z.number().describe("Max number of frames (default 20).").optional(),
 };
 
+const getRegistersDescription = `Read the CPU core registers (r0-r15, sp, lr, pc, xPSR, ...) of a thread on
+the SHARED debug session via the 'Registers' scope, frame-pinned to the selected/stopped thread. For
+M-profile special/system registers ($msp/$psp/$control/...) use read_special_reg. The session is shared —
+re-check get_debug_state if the human may have acted since your last call.`;
+
+const getVariablesDescription = `Read in-scope variables (locals, and globals/statics) of a thread's
+current frame on the SHARED debug session, grouped by scope, frame-pinned to the selected/stopped thread.
+A non-zero variablesReference marks an expandable structure. Re-check get_debug_state if the human may
+have acted since your last call.`;
+
+const readMemoryDescription = `Read target memory on the SHARED debug session. 'address' is a hex string or
+decimal (e.g. '0x20000000'); returns 'count' bytes (default 64) as hex. Invisible read — narrate the
+result to the human.`;
+
+const writeMemoryDescription = `Write target memory on the SHARED debug session. 'address' is a hex
+string/decimal; 'data' is hex bytes (e.g. 'deadbeef' or 'de ad be ef'). DANGEROUS: mutates live target
+state — confirm intent and narrate to the human. Not all adapters support memory writes.`;
+
+const getRegistersInputSchema = {
+    threadId: z.number().describe("Thread to read from; defaults to the selected/stopped thread.").optional(),
+};
+
+const getVariablesInputSchema = {
+    threadId: z.number().describe("Thread to read from; defaults to the selected/stopped thread.").optional(),
+    scope: z.string().describe("Only return this scope (e.g. 'Local'). Omit for all non-register scopes.").optional(),
+};
+
+const readMemoryInputSchema = {
+    address: z.string().describe("Address as a hex string or decimal, e.g. '0x20000000'."),
+    count: z.number().describe("Number of bytes to read (default 64).").optional(),
+    offset: z.number().describe("Byte offset from address (default 0).").optional(),
+};
+
+const writeMemoryInputSchema = {
+    address: z.string().describe("Address as a hex string or decimal, e.g. '0x20000000'."),
+    data: z.string().describe("Hex bytes to write, e.g. 'deadbeef' or 'de ad be ef'."),
+};
+
 // Standard ARM Cortex-M special/system registers to read when no specific name is
 // given. msplim/psplim exist only on ARMv8-M (e.g. Cortex-M33); they read back as
 // null (unavailable) on ARMv7-M (e.g. Cortex-M7).
@@ -194,12 +234,33 @@ const tools = [
         description: getStackDescription,
         inputSchema: getStackInputSchema,
     },
+    {
+        name: "get_registers",
+        description: getRegistersDescription,
+        inputSchema: getRegistersInputSchema,
+    },
+    {
+        name: "get_variables",
+        description: getVariablesDescription,
+        inputSchema: getVariablesInputSchema,
+    },
+    {
+        name: "read_memory",
+        description: readMemoryDescription,
+        inputSchema: readMemoryInputSchema,
+    },
+    {
+        name: "write_memory",
+        description: writeMemoryDescription,
+        inputSchema: writeMemoryInputSchema,
+    },
 ];
 export class DebugServer extends EventEmitter implements DebugServerEvents {
     private server: net.Server | null = null;
     private port: number = 4711;
     private portConfigPath: string | null = null;
     private activeTransports: Record<string, SSEServerTransport> = {};
+    private streamableTransports: Record<string, StreamableHTTPServerTransport> = {};
     private mcpServer: McpServer;
     private _isRunning: boolean = false;
     private tracker: SessionStateTracker;
@@ -213,61 +274,94 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         // an unregistered tracker would have an empty state map and silently
         // degrade resolution back to the wrong-thread bug this fork removes.
         this.tracker = tracker;
-        this.mcpServer = new McpServer({
+        this.mcpServer = this.createMcpServer();
+    }
+
+    /**
+     * Build an McpServer with every tool registered against this DebugServer's
+     * handlers. A fresh instance is used PER streamable-HTTP session, because the
+     * SDK's Protocol binds a single `_transport` per server and routes all
+     * responses through it — one server cannot correctly serve concurrent
+     * sessions. All instances share the same handlers (and thus the same live
+     * debug-session state via the tracker).
+     */
+    private createMcpServer(): McpServer {
+        const server = new McpServer({
             name: "Debug Server",
             version: "1.0.0",
         });
 
-        // Setup MCP tools to use our existing handlers
-        this.mcpServer.tool("listFiles", listFilesDescription, listFilesInputSchema, async (args: any) => {
+        server.tool("listFiles", listFilesDescription, listFilesInputSchema, async (args: any) => {
             const files = await this.handleListFiles(args);
             return { content: [{ type: "text", text: JSON.stringify(files) }] };
         });
 
-        this.mcpServer.tool("getFileContent", getFileContentDescription, getFileContentInputSchema, async (args: any) => {
+        server.tool("getFileContent", getFileContentDescription, getFileContentInputSchema, async (args: any) => {
             const content = await this.handleGetFile(args);
             return { content: [{ type: "text", text: content }] };
         });
 
-        this.mcpServer.tool("debug", debugDescription, debugInputSchema, async (args: any) => {
+        server.tool("debug", debugDescription, debugInputSchema, async (args: any) => {
             const results = await this.handleDebug(args);
             return { content: [{ type: "text", text: results.join('\n') }] };
         });
 
-        this.mcpServer.tool("get_debug_state", getDebugStateDescription, getDebugStateInputSchema, async () => {
+        server.tool("get_debug_state", getDebugStateDescription, getDebugStateInputSchema, async () => {
             const state = await this.handleGetDebugState();
             return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
         });
 
-        this.mcpServer.tool("gdb_exec", gdbExecDescription, gdbExecInputSchema, async (args: any) => {
+        server.tool("gdb_exec", gdbExecDescription, gdbExecInputSchema, async (args: any) => {
             const out = await this.handleGdbExec(args);
             return { content: [{ type: "text", text: out }] };
         });
 
-        this.mcpServer.tool("read_special_reg", readSpecialRegDescription, readSpecialRegInputSchema, async (args: any) => {
+        server.tool("read_special_reg", readSpecialRegDescription, readSpecialRegInputSchema, async (args: any) => {
             const regs = await this.handleReadSpecialReg(args);
             return { content: [{ type: "text", text: JSON.stringify(regs, null, 2) }] };
         });
 
-        this.mcpServer.tool("set_watchpoint", setWatchpointDescription, setWatchpointInputSchema, async (args: any) => {
+        server.tool("set_watchpoint", setWatchpointDescription, setWatchpointInputSchema, async (args: any) => {
             const result = await this.handleSetWatchpoint(args);
             return { content: [{ type: "text", text: result }] };
         });
 
-        this.mcpServer.tool("list_threads", listThreadsDescription, listThreadsInputSchema, async () => {
+        server.tool("list_threads", listThreadsDescription, listThreadsInputSchema, async () => {
             const threads = await this.handleListThreads();
             return { content: [{ type: "text", text: JSON.stringify(threads, null, 2) }] };
         });
 
-        this.mcpServer.tool("select_thread", selectThreadDescription, selectThreadInputSchema, async (args: any) => {
+        server.tool("select_thread", selectThreadDescription, selectThreadInputSchema, async (args: any) => {
             const result = await this.handleSelectThread(args);
             return { content: [{ type: "text", text: result }] };
         });
 
-        this.mcpServer.tool("get_stack", getStackDescription, getStackInputSchema, async (args: any) => {
+        server.tool("get_stack", getStackDescription, getStackInputSchema, async (args: any) => {
             const stack = await this.handleGetStack(args);
             return { content: [{ type: "text", text: JSON.stringify(stack, null, 2) }] };
         });
+
+        server.tool("get_registers", getRegistersDescription, getRegistersInputSchema, async (args: any) => {
+            const regs = await this.handleGetRegisters(args);
+            return { content: [{ type: "text", text: JSON.stringify(regs, null, 2) }] };
+        });
+
+        server.tool("get_variables", getVariablesDescription, getVariablesInputSchema, async (args: any) => {
+            const vars = await this.handleGetVariables(args);
+            return { content: [{ type: "text", text: JSON.stringify(vars, null, 2) }] };
+        });
+
+        server.tool("read_memory", readMemoryDescription, readMemoryInputSchema, async (args: any) => {
+            const mem = await this.handleReadMemory(args);
+            return { content: [{ type: "text", text: JSON.stringify(mem, null, 2) }] };
+        });
+
+        server.tool("write_memory", writeMemoryDescription, writeMemoryInputSchema, async (args: any) => {
+            const result = await this.handleWriteMemory(args);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        return server;
     }
 
     get isRunning(): boolean {
@@ -346,8 +440,9 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         this.server = http.createServer(async (req, res) => {
             // Handle CORS
             res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
             res.setHeader('Access-Control-Allow-Headers', '*');
+            res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
 
             if (req.method === 'OPTIONS') {
                 res.writeHead(204).end();
@@ -391,7 +486,13 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return;
             }
 
-            // SSE endpoint
+            // Streamable HTTP endpoint (Claude Code's preferred transport).
+            if (req.url === '/mcp' || req.url?.startsWith('/mcp?')) {
+                await this.handleStreamableHttp(req, res);
+                return;
+            }
+
+            // SSE endpoint (legacy)
             if (req.method === 'GET' && req.url === '/sse') {
                 const transport = new SSEServerTransport('/messages', res);
                 this.activeTransports[transport.sessionId] = transport;
@@ -426,6 +527,53 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         });
     }
 
+    /**
+     * Streamable HTTP transport (MCP spec 2025-03-26), Claude Code's preferred
+     * channel. Stateful: the client's initialize POST (no session id) creates a
+     * transport whose generated id is returned in the mcp-session-id header;
+     * subsequent POST/GET/DELETE carry that id and route to the same transport.
+     */
+    private async handleStreamableHttp(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        let transport = sessionId ? this.streamableTransports[sessionId] : undefined;
+
+        if (!transport) {
+            if (req.method !== 'POST') {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    error: { code: -32000, message: 'Missing or unknown mcp-session-id' },
+                    id: null,
+                }));
+                return;
+            }
+            // New session from the client's initialize request.
+            const newTransport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+                onsessioninitialized: (sid: string) => {
+                    this.streamableTransports[sid] = newTransport;
+                },
+            });
+            // A fresh server per session (see createMcpServer) — one server cannot
+            // route responses for multiple concurrent transports.
+            const sessionServer = this.createMcpServer();
+            await sessionServer.connect(newTransport);
+            // connect() OVERWRITES transport.onclose with the SDK's own handler, so
+            // wire our map cleanup AFTER connect and chain to the SDK's — otherwise
+            // the session entry (and its server) leaks on every disconnect.
+            const protocolOnClose = newTransport.onclose;
+            newTransport.onclose = () => {
+                protocolOnClose?.();
+                if (newTransport.sessionId) {
+                    delete this.streamableTransports[newTransport.sessionId];
+                }
+            };
+            transport = newTransport;
+        }
+
+        await transport.handleRequest(req, res);
+    }
+
     // Helper method to handle tool calls
     private async handleCommand(request: ToolRequest): Promise<any> {
         switch (request.tool) {
@@ -449,6 +597,14 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return await this.handleSelectThread(request.arguments);
             case 'get_stack':
                 return await this.handleGetStack(request.arguments);
+            case 'get_registers':
+                return await this.handleGetRegisters(request.arguments);
+            case 'get_variables':
+                return await this.handleGetVariables(request.arguments);
+            case 'read_memory':
+                return await this.handleReadMemory(request.arguments);
+            case 'write_memory':
+                return await this.handleWriteMemory(request.arguments);
             default:
                 throw new Error(`Unknown tool: ${request.tool}`);
         }
@@ -866,6 +1022,95 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         return { threadId, frames };
     }
 
+    /** Read the CPU core registers via the 'Registers' scope (frame-pinned). */
+    private async handleGetRegisters(payload: { threadId?: number }): Promise<any> {
+        const { session, threadId, frameId } = await this.resolveFrameForThread(payload?.threadId);
+        const scopesResp = await session.customRequest('scopes', { frameId });
+        const regScope = (scopesResp?.scopes ?? []).find((s: any) => s.name === 'Registers');
+        if (!regScope) {
+            return { threadId, registers: [], note: 'No Registers scope (target not stopped at a cortex-debug frame?)' };
+        }
+        const varsResp = await session.customRequest('variables', { variablesReference: regScope.variablesReference });
+        const registers = (varsResp?.variables ?? []).map((v: any) => ({ name: v.name, value: v.value }));
+        return { threadId, registers };
+    }
+
+    /** Read in-scope variables (locals/globals/statics), grouped by scope. */
+    private async handleGetVariables(payload: { threadId?: number; scope?: string }): Promise<any> {
+        const { session, threadId, frameId } = await this.resolveFrameForThread(payload?.threadId);
+        const scopesResp = await session.customRequest('scopes', { frameId });
+        const scopes = scopesResp?.scopes ?? [];
+
+        const result: any = { threadId, scopes: {} };
+        for (const scope of scopes) {
+            if (scope.name === 'Registers') {
+                continue; // use get_registers for those
+            }
+            if (payload?.scope && scope.name !== payload.scope) {
+                continue;
+            }
+            const varsResp = await session.customRequest('variables', { variablesReference: scope.variablesReference });
+            result.scopes[scope.name] = (varsResp?.variables ?? []).map((v: any) => ({
+                name: v.name,
+                value: v.value,
+                type: v.type,
+                variablesReference: v.variablesReference,
+            }));
+        }
+        return result;
+    }
+
+    /** Read target memory; returns bytes as hex. */
+    private async handleReadMemory(payload: { address: string | number; count?: number; offset?: number }): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        if (payload?.address === undefined || payload.address === '') {
+            throw new Error('address is required');
+        }
+        const memoryReference = String(payload.address);
+        const count = payload.count ?? 64;
+        const resp = await session.customRequest('readMemory', {
+            memoryReference,
+            offset: payload.offset ?? 0,
+            count,
+        });
+        const data = resp?.data ? Buffer.from(resp.data, 'base64') : Buffer.alloc(0);
+        const hex = (data.toString('hex').match(/../g) ?? []).join(' ');
+        return {
+            address: resp?.address ?? memoryReference,
+            bytes: data.length,
+            unreadableBytes: resp?.unreadableBytes,
+            hex,
+        };
+    }
+
+    /** Write target memory from hex bytes. DANGEROUS — mutates live state. */
+    private async handleWriteMemory(payload: { address: string | number; data: string }): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        if (payload?.address === undefined || payload.address === '') {
+            throw new Error('address is required');
+        }
+        if (!payload?.data) {
+            throw new Error('data (hex bytes) is required');
+        }
+        const memoryReference = String(payload.address);
+        const hex = payload.data.replace(/0x/gi, '').replace(/\s+/g, '');
+        if (hex.length === 0 || hex.length % 2 !== 0 || /[^0-9a-fA-F]/.test(hex)) {
+            throw new Error('data must be an even-length hex string, e.g. "deadbeef"');
+        }
+        const buf = Buffer.from(hex, 'hex');
+        const resp = await session.customRequest('writeMemory', {
+            memoryReference,
+            data: buf.toString('base64'),
+        });
+        return { address: memoryReference, bytesWritten: resp?.bytesWritten ?? buf.length };
+    }
+
     /**
      * Drive flow control via the native VS Code command so the human watches the
      * highlighted line move, exactly as if they had clicked the toolbar (raw
@@ -1080,6 +1325,11 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 transport.close();
             });
             this.activeTransports = {};
+
+            Object.values(this.streamableTransports).forEach(transport => {
+                transport.close();
+            });
+            this.streamableTransports = {};
 
             this.server.close(() => {
                 this.server = null;
