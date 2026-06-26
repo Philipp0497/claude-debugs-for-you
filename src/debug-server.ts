@@ -158,6 +158,26 @@ with the source line. Returns {fault:false} for a benign 'exception' stop. Call 
 
 const explainFaultInputSchema = {};
 
+const inspectTcbDescription = `Inspect ThreadX threads on the SHARED session by walking the TCB list
+(_tx_thread_created_ptr). For each thread (or one by name): name, state, priority, run count, stack
+bounds, the saved stack pointer, and — for NON-running threads — a REAL top frame (saved PC decoded from
+the TCB's saved context, bypassing the gdb-server's RTOS unwinder which is unreliable for non-current
+threads). Per-thread saved SP/PC are authoritative here (unlike read_special_reg's CPU-global regs).
+Requires ThreadX debug symbols; only meaningful while stopped.`;
+
+const threadStackUsageDescription = `Report per-thread ThreadX stack high-water usage on the SHARED
+session by scanning each stack for the 0xEFEFEFEF fill pattern (written at thread create unless
+TX_DISABLE_STACK_FILLING). Returns size, peak-used, free, and peak%% per thread (or one by name) — an
+early-warning for stack overflow. Requires ThreadX symbols and stack filling enabled.`;
+
+const inspectTcbInputSchema = {
+    name: z.string().describe("Thread name to inspect; omit for all threads.").optional(),
+};
+
+const threadStackUsageInputSchema = {
+    name: z.string().describe("Thread name; omit for all threads.").optional(),
+};
+
 const startSessionDescription = `Launch the debug session on the SHARED setup from a launch.json
 configuration (works with launch OR attach configs). REFUSES if a session is already active — use
 restart_session to relaunch. After launch the target typically halts at entry/main; the result reports
@@ -222,6 +242,15 @@ const FAULT_EXCEPTIONS: Record<number, string> = {
 function hex32(n: number): string {
     return '0x' + (n >>> 0).toString(16).padStart(8, '0');
 }
+
+// ThreadX tx_thread_state values (Azure RTOS / Eclipse ThreadX, tx_api.h).
+const TX_STATE_NAMES = [
+    'READY', 'COMPLETED', 'TERMINATED', 'SUSPENDED', 'SLEEP', 'QUEUE_SUSP',
+    'SEMAPHORE_SUSP', 'EVENT_FLAG', 'BLOCK_MEMORY', 'BYTE_MEMORY', 'IO_DRIVER',
+    'FILE', 'TCP_IP', 'MUTEX_SUSP', 'PRIORITY_CHANGE',
+];
+// Default ThreadX stack fill word (filled at create unless TX_DISABLE_STACK_FILLING).
+const TX_STACK_FILL = 0xefefefef;
 
 const listFilesInputSchema = {
     includePatterns: z.array(z.string()).describe("Glob patterns to include (e.g. ['**/*.js'])").optional(),
@@ -320,6 +349,16 @@ const tools = [
         name: "explain_fault",
         description: explainFaultDescription,
         inputSchema: explainFaultInputSchema,
+    },
+    {
+        name: "inspect_tcb",
+        description: inspectTcbDescription,
+        inputSchema: inspectTcbInputSchema,
+    },
+    {
+        name: "thread_stack_usage",
+        description: threadStackUsageDescription,
+        inputSchema: threadStackUsageInputSchema,
     },
     {
         name: "start_session",
@@ -440,6 +479,16 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
 
         server.tool("explain_fault", explainFaultDescription, explainFaultInputSchema, async () => {
             const result = await this.handleExplainFault();
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        server.tool("inspect_tcb", inspectTcbDescription, inspectTcbInputSchema, async (args: any) => {
+            const result = await this.handleInspectTcb(args);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        server.tool("thread_stack_usage", threadStackUsageDescription, threadStackUsageInputSchema, async (args: any) => {
+            const result = await this.handleThreadStackUsage(args);
             return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         });
 
@@ -699,6 +748,10 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return await this.handleWriteMemory(request.arguments);
             case 'explain_fault':
                 return await this.handleExplainFault();
+            case 'inspect_tcb':
+                return await this.handleInspectTcb(request.arguments);
+            case 'thread_stack_usage':
+                return await this.handleThreadStackUsage(request.arguments);
             case 'start_session':
                 return await this.handleSessionLaunch(request.arguments, false);
             case 'restart_session':
@@ -1240,6 +1293,194 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             }
         }
         return map;
+    }
+
+    /** Evaluate an expression via the frame-pinned 'watch' path; raw string or undefined. */
+    private async evalValue(session: vscode.DebugSession, frameId: number, expr: string): Promise<string | undefined> {
+        try {
+            const r = await session.customRequest('evaluate', { expression: expr, frameId, context: 'watch' });
+            const raw = (r?.result ?? '').trim();
+            return !raw || raw.startsWith('<') ? undefined : raw;
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** Extract the first hex/decimal integer from an evaluate result string. */
+    private parseNum(raw: string | undefined): number | undefined {
+        if (raw === undefined) {
+            return undefined;
+        }
+        const m = raw.match(/0x[0-9a-fA-F]+|\d+/);
+        return m ? parseInt(m[0], m[0].toLowerCase().startsWith('0x') ? 16 : 10) : undefined;
+    }
+
+    /** Walk the ThreadX created-thread list (circular) via typed GDB evaluation. */
+    private async listTcbs(session: vscode.DebugSession, frameId: number): Promise<any[]> {
+        const head = this.parseNum(await this.evalValue(session, frameId, '_tx_thread_created_ptr'));
+        if (!head) {
+            return [];
+        }
+        // Confirm the TX_THREAD type is usable (debug info present) before casting —
+        // otherwise the per-field casts all fail and we'd emit a bogus null thread.
+        if (this.parseNum(await this.evalValue(session, frameId, 'sizeof(TX_THREAD)')) === undefined) {
+            return [];
+        }
+        const count = this.parseNum(await this.evalValue(session, frameId, '_tx_thread_created_count')) ?? 0;
+        const current = this.parseNum(await this.evalValue(session, frameId, '_tx_thread_current_ptr'));
+        const max = Math.min(count || 64, 64); // cap: the list is circular
+
+        const list: any[] = [];
+        let ptr: number | undefined = head;
+        for (let i = 0; i < max && ptr; i++) {
+            const base = `((TX_THREAD*)${hex32(ptr)})`;
+            const nameRaw = await this.evalValue(session, frameId, `${base}->tx_thread_name`);
+            const quoted = nameRaw?.match(/"([^"]*)"/);
+            const name = quoted ? (quoted[1] || '(unnamed)') : (nameRaw ?? '(unnamed)');
+            const state = this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_state`)) ?? -1;
+            list.push({
+                ptr,
+                name,
+                state,
+                stateName: TX_STATE_NAMES[state] ?? `state ${state}`,
+                priority: this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_priority`)),
+                runCount: this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_run_count`)),
+                stackPtr: this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_stack_ptr`)),
+                stackStart: this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_stack_start`)),
+                stackEnd: this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_stack_end`)),
+                stackSize: this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_stack_size`)),
+                isCurrent: ptr === current,
+            });
+            const next = this.parseNum(await this.evalValue(session, frameId, `${base}->tx_thread_created_next`));
+            if (!next || next === head) {
+                break; // circular list — back at the head
+            }
+            ptr = next;
+        }
+        return list;
+    }
+
+    /**
+     * Decode a NON-running ThreadX thread's saved top PC from its TCB stack pointer.
+     * Cortex-M (GCC) saved frame: first word is EXC_RETURN; non-FP (bit4 set) puts the
+     * saved PC at +60, FP (bit4 clear) at +124. Bypasses the gdb-server RTOS unwinder.
+     */
+    private async savedThreadPc(session: vscode.DebugSession, stackPtr: number): Promise<number | undefined> {
+        try {
+            const lr = await this.readU32(session, stackPtr);
+            if ((lr >>> 24) !== 0xff) {
+                return undefined; // not an EXC_RETURN-first frame — unknown port layout
+            }
+            const pcOffset = (lr & 0x10) ? 60 : 124; // non-FP : FP
+            const pc = await this.readU32(session, stackPtr + pcOffset);
+            return pc & ~1; // clear the Thumb bit for symbolization
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** Inspect ThreadX TCBs: fields + a real saved top frame for non-running threads. */
+    private async handleInspectTcb(payload: { name?: string }): Promise<any> {
+        const { session, frameId } = await this.tracker.resolveActiveFrame();
+        const tcbs = await this.listTcbs(session, frameId);
+        if (tcbs.length === 0) {
+            return { threads: [], note: 'No ThreadX threads found (scheduler not started, or ThreadX symbols missing).' };
+        }
+        const selected = payload?.name ? tcbs.filter((t) => t.name === payload.name) : tcbs;
+        if (payload?.name && selected.length === 0) {
+            return { threads: [], note: `No thread named "${payload.name}". Names: ${tcbs.map((t) => t.name).join(', ')}` };
+        }
+
+        const threads: any[] = [];
+        for (const t of selected) {
+            const entry: any = {
+                name: t.name,
+                state: t.stateName,
+                priority: t.priority,
+                runCount: t.runCount,
+                current: t.isCurrent,
+                stack: {
+                    start: t.stackStart !== undefined ? hex32(t.stackStart) : null,
+                    end: t.stackEnd !== undefined ? hex32(t.stackEnd) : null,
+                    size: t.stackSize,
+                    savedSp: t.stackPtr !== undefined ? hex32(t.stackPtr) : null,
+                },
+            };
+            if (!t.isCurrent && t.stackPtr) {
+                const pc = await this.savedThreadPc(session, t.stackPtr);
+                if (pc !== undefined) {
+                    entry.pc = hex32(pc);
+                    try {
+                        const info = await this.handleGdbExec({ command: `info line *${hex32(pc)}` });
+                        entry.location = info.split('\n')[0];
+                    } catch {
+                        // best-effort
+                    }
+                }
+            } else if (t.isCurrent) {
+                entry.note = 'running thread — use get_stack / get_registers for its live state';
+            }
+            threads.push(entry);
+        }
+        return { threads };
+    }
+
+    /** Per-thread ThreadX stack high-water via the 0xEFEFEFEF fill-pattern scan. */
+    private async handleThreadStackUsage(payload: { name?: string }): Promise<any> {
+        const { session, frameId } = await this.tracker.resolveActiveFrame();
+        const tcbs = await this.listTcbs(session, frameId);
+        if (tcbs.length === 0) {
+            return { threads: [], note: 'No ThreadX threads found (scheduler not started, or ThreadX symbols missing).' };
+        }
+        const selected = payload?.name ? tcbs.filter((t) => t.name === payload.name) : tcbs;
+        if (payload?.name && selected.length === 0) {
+            return { threads: [], note: `No thread named "${payload.name}". Names: ${tcbs.map((t) => t.name).join(', ')}` };
+        }
+
+        const threads: any[] = [];
+        for (const t of selected) {
+            const entry: any = { name: t.name, size: t.stackSize };
+            if (t.stackStart && t.stackSize) {
+                try {
+                    Object.assign(entry, await this.stackHighWater(session, t.stackStart, t.stackSize));
+                } catch {
+                    entry.note = 'stack read failed';
+                }
+            } else {
+                entry.note = 'stack bounds unavailable';
+            }
+            threads.push(entry);
+        }
+        return { threads };
+    }
+
+    /** Scan a stack region for the fill pattern; report peak usage from the low end. */
+    private async stackHighWater(session: vscode.DebugSession, start: number, size: number): Promise<any> {
+        const resp = await session.customRequest('readMemory', { memoryReference: hex32(start), offset: 0, count: size });
+        const data = resp?.data ? Buffer.from(resp.data, 'base64') : Buffer.alloc(0);
+        const words = Math.floor(data.length / 4);
+        if (words === 0) {
+            return { note: 'could not read stack memory' };
+        }
+        let firstNonFill = -1;
+        let fillCount = 0;
+        for (let i = 0; i < words; i++) {
+            if (data.readUInt32LE(i * 4) === TX_STACK_FILL) {
+                fillCount++;
+            } else if (firstNonFill < 0) {
+                firstNonFill = i;
+            }
+        }
+        if (fillCount === 0) {
+            return { note: 'no 0xEFEFEFEF fill found — stack filling disabled (TX_DISABLE_STACK_FILLING) or stack fully consumed; high-water unavailable' };
+        }
+        if (firstNonFill < 0) {
+            firstNonFill = words; // entire stack still filled (never used)
+        }
+        const freeBytes = firstNonFill * 4;
+        const peakUsedBytes = size - freeBytes;
+        const peakPct = Math.round((peakUsedBytes / size) * 1000) / 10;
+        return { peakUsedBytes, freeBytes, peakPct, overflowRisk: freeBytes <= 64 };
     }
 
     /**

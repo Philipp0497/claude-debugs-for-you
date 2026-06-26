@@ -331,6 +331,37 @@ curl -s localhost:3333/tcp -H 'content-type: application/json' \
 
 ---
 
+## Feature 4 (Phase 6) — ThreadX TCB introspection — READY TO TEST
+
+Two tools (18 & 19) that walk the ThreadX TCB list (`_tx_thread_created_ptr`) via typed GDB evaluation — verified against Azure/Eclipse ThreadX source.
+
+- **`inspect_tcb {name?}`** — per thread: name, state, priority, run count, stack bounds, **saved SP**, and for **non-running** threads a **REAL top frame** (saved PC decoded from the TCB's saved context at +60/+124 by EXC_RETURN FP bit — *bypasses OpenOCD's broken RTOS unwinder*, no more `??@0x4`). Retires open finding #2 (the per-thread saved SP is authoritative here, unlike `read_special_reg`'s CPU-global regs).
+- **`thread_stack_usage {name?}`** — per-thread high-water by scanning for the `0xEFEFEFEF` fill (on by default unless `TX_DISABLE_STACK_FILLING`): `peakUsedBytes` / `freeBytes` / `peakPct` / `overflowRisk`.
+
+**Reload the dev host (Ctrl/Cmd+R)** first (restart the Claude session if on stdio MCP).
+
+### Test it (stopped at a breakpoint, scheduler running)
+
+```bash
+# Per-thread stack high-water for all 7 threads:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"thread_stack_usage","arguments":{}}'
+
+# A non-running thread's TCB + REAL top frame (the OpenOCD-unwind gap):
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"inspect_tcb","arguments":{"name":"mb-tcp"}}'
+
+# All TCBs:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"inspect_tcb","arguments":{}}'
+```
+
+### The gate (Feature 4)
+
+`thread_stack_usage` reports a plausible high-water for each of the 7 threads (cross-check a known one against its linker stack size), and `inspect_tcb mb-tcp` returns its state/priority/run-count/**saved SP** + a **real** top frame (a legit function/`file:line`, **not** `??@0x4` like OpenOCD gives). Spot-check the saved SP against the value `select_thread mb-tcp` + `read_special_reg sp` gave in Phase 4. This retires open finding #2 **and** the OpenOCD non-current-unwind gap. (`inspect_tcb` marks the running thread and points to `get_stack` for its live state.)
+
+---
+
 ## If you hit something
 
 Report: what you evaluated, what the tool returned, and what the VS Code panel showed for the same thread/frame. That, plus whether the `stopped` event had a `threadId`, pinpoints it fast.

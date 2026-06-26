@@ -159,6 +159,18 @@ and ARMv8-M Baseline (M23): HardFault-only — verdict from ICSR.VECTACTIVE + th
 the PRE-FAULT context (faulting PC/LR/xPSR + R0-R3/R12) from the stacked exception frame via EXC_RETURN,
 with the source line. Returns {fault:false} for a benign 'exception' stop. Call while stopped in the handler.`;
 
+const inspectTcbDescription = `Inspect ThreadX threads on the SHARED session by walking the TCB list
+(_tx_thread_created_ptr). For each thread (or one by name): name, state, priority, run count, stack
+bounds, the saved stack pointer, and — for NON-running threads — a REAL top frame (saved PC decoded from
+the TCB's saved context, bypassing the gdb-server's RTOS unwinder which is unreliable for non-current
+threads). Per-thread saved SP/PC are authoritative here (unlike read_special_reg's CPU-global regs).
+Requires ThreadX debug symbols; only meaningful while stopped.`;
+
+const threadStackUsageDescription = `Report per-thread ThreadX stack high-water usage on the SHARED
+session by scanning each stack for the 0xEFEFEFEF fill pattern (written at thread create unless
+TX_DISABLE_STACK_FILLING). Returns size, peak-used, free, and peak% per thread (or one by name) — an
+early-warning for stack overflow. Requires ThreadX symbols and stack filling enabled.`;
+
 const startSessionDescription = `Launch the debug session on the SHARED setup from a launch.json
 configuration (works with launch OR attach configs). REFUSES if a session is already active — use
 restart_session to relaunch. After launch the target typically halts at entry/main; the result reports
@@ -365,6 +377,26 @@ const tools = [
         name: "explain_fault",
         description: explainFaultDescription,
         inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "inspect_tcb",
+        description: inspectTcbDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                name: { type: "string", description: "Thread name to inspect; omit for all threads." }
+            }
+        },
+    },
+    {
+        name: "thread_stack_usage",
+        description: threadStackUsageDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                name: { type: "string", description: "Thread name; omit for all threads." }
+            }
+        },
     },
     {
         name: "start_session",
