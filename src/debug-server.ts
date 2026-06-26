@@ -14,7 +14,10 @@ import { randomUUID } from 'crypto';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import * as fs from 'fs';
+import * as path from 'path';
 import { SessionStateTracker } from './session-state';
+import { parseSvd, SvdModel, SvdPeripheral, SvdRegister } from './svd';
 
 export interface DebugCommand {
     command: 'listFiles' | 'getFileContent' | 'debug';
@@ -147,6 +150,17 @@ const readMemoryInputSchema = {
 const writeMemoryInputSchema = {
     address: z.string().describe("Address as a hex string or decimal, e.g. '0x20000000'."),
     data: z.string().describe("Hex bytes to write, e.g. 'deadbeef' or 'de ad be ef'."),
+};
+
+const readPeripheralDescription = `Read and decode a memory-mapped peripheral register from the device
+SVD on the SHARED session. 'path' is "PERIPH.REG" to read one register and decode its bitfields (e.g.
+"ETH.MACCR" resolves to Ethernet_MAC.MACCR by group/prefix; "RCC.CR"), or "PERIPH" / a group or name
+prefix (e.g. "Ethernet_MMC", "ETH", "RCC") for a register overview. Field values are masked from the LIVE
+register read. Uses the launch.json svdFile (must be an .svd path, not a CMSIS-pack/device name).`;
+
+const readPeripheralInputSchema = {
+    path: z.string().describe("PERIPH.REG to decode one register, or PERIPH / group / name-prefix for an overview (e.g. 'ETH.MACCR', 'RCC', 'Ethernet_MMC')."),
+    maxRegisters: z.number().describe("Cap on registers in an overview (default 48).").optional(),
 };
 
 const explainFaultDescription = `Decode the current ARM Cortex-M fault on the SHARED session. Auto-detects
@@ -346,6 +360,11 @@ const tools = [
         inputSchema: writeMemoryInputSchema,
     },
     {
+        name: "read_peripheral",
+        description: readPeripheralDescription,
+        inputSchema: readPeripheralInputSchema,
+    },
+    {
         name: "explain_fault",
         description: explainFaultDescription,
         inputSchema: explainFaultInputSchema,
@@ -380,6 +399,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
     private mcpServer: McpServer;
     private _isRunning: boolean = false;
     private tracker: SessionStateTracker;
+    private svdCache: { path: string; mtimeMs: number; model: SvdModel } | undefined;
 
     constructor(port: number | undefined, portConfigPath: string | undefined, tracker: SessionStateTracker) {
         super();
@@ -474,6 +494,11 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
 
         server.tool("write_memory", writeMemoryDescription, writeMemoryInputSchema, async (args: any) => {
             const result = await this.handleWriteMemory(args);
+            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+        });
+
+        server.tool("read_peripheral", readPeripheralDescription, readPeripheralInputSchema, async (args: any) => {
+            const result = await this.handleReadPeripheral(args);
             return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
         });
 
@@ -746,6 +771,8 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                 return await this.handleReadMemory(request.arguments);
             case 'write_memory':
                 return await this.handleWriteMemory(request.arguments);
+            case 'read_peripheral':
+                return await this.handleReadPeripheral(request.arguments);
             case 'explain_fault':
                 return await this.handleExplainFault();
             case 'inspect_tcb':
@@ -1260,6 +1287,156 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             data: buf.toString('base64'),
         });
         return { address: memoryReference, bytesWritten: resp?.bytesWritten ?? buf.length };
+    }
+
+    /** Load + cache the device SVD model from the launch.json svdFile. */
+    private getSvdModel(session: vscode.DebugSession): SvdModel {
+        const cfg: any = session.configuration ?? {};
+        let svdPath: string | undefined = cfg.svdFile ?? cfg.svdPath;
+        if (!svdPath || typeof svdPath !== 'string') {
+            throw new Error('No svdFile configured in launch.json (needed to decode peripherals).');
+        }
+        if (!path.isAbsolute(svdPath)) {
+            const folder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? cfg.cwd;
+            if (folder) {
+                svdPath = path.resolve(folder, svdPath);
+            }
+        }
+        if (!fs.existsSync(svdPath) || !fs.statSync(svdPath).isFile()) {
+            throw new Error(`svdFile not found (or not a file) at "${svdPath}". (If launch.json uses a CMSIS-pack/device name, point svdFile at an .svd file instead.)`);
+        }
+        const mtimeMs = fs.statSync(svdPath).mtimeMs;
+        if (this.svdCache && this.svdCache.path === svdPath && this.svdCache.mtimeMs === mtimeMs) {
+            return this.svdCache.model;
+        }
+        const model = parseSvd(fs.readFileSync(svdPath, 'utf8'));
+        this.svdCache = { path: svdPath, mtimeMs, model };
+        return model;
+    }
+
+    /** Read a register value (size bits, little-endian) as a BigInt (handles 32-bit fields). */
+    private async readRegisterValue(session: vscode.DebugSession, addr: number, sizeBits: number): Promise<bigint> {
+        const bytes = Math.max(1, Math.ceil(sizeBits / 8));
+        const resp = await session.customRequest('readMemory', { memoryReference: hex32(addr), offset: 0, count: bytes });
+        const data = resp?.data ? Buffer.from(resp.data, 'base64') : Buffer.alloc(0);
+        let v = 0n;
+        for (let i = Math.min(bytes, data.length) - 1; i >= 0; i--) {
+            v = (v << 8n) | BigInt(data[i]);
+        }
+        return v;
+    }
+
+    /** Read + decode one register's fields from the live value. */
+    private async readDecodeRegister(session: vscode.DebugSession, p: SvdPeripheral, reg: SvdRegister): Promise<any> {
+        const addr = (p.baseAddress + reg.addressOffset) >>> 0;
+        const value = await this.readRegisterValue(session, addr, reg.size);
+        const valHex = '0x' + value.toString(16).padStart(Math.ceil(reg.size / 4), '0');
+        const fields = reg.fields
+            .slice()
+            .sort((a, b) => b.bitOffset - a.bitOffset)
+            .map((f) => {
+                const fv = (value >> BigInt(f.bitOffset)) & ((1n << BigInt(f.bitWidth)) - 1n);
+                const msb = f.bitOffset + f.bitWidth - 1;
+                const bits = f.bitWidth === 1 ? `[${f.bitOffset}]` : `[${msb}:${f.bitOffset}]`;
+                const entry: any = { name: f.name, bits, value: '0x' + fv.toString(16) };
+                if (f.description) {
+                    entry.description = f.description;
+                }
+                return entry;
+            });
+        return {
+            peripheral: p.name,
+            register: reg.name,
+            address: hex32(addr),
+            size: reg.size,
+            value: valHex,
+            resetValue: reg.resetValue !== undefined ? hex32(reg.resetValue) : undefined,
+            fields,
+        };
+    }
+
+    /** Decode a peripheral register (PERIPH.REG) or list a peripheral/group (PERIPH). */
+    private async handleReadPeripheral(payload: { path?: string; maxRegisters?: number }): Promise<any> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            throw new Error('No active debug session');
+        }
+        if (!payload?.path) {
+            throw new Error('path is required, e.g. "ETH.MACCR" or "RCC".');
+        }
+        const model = this.getSvdModel(session);
+        const parts = payload.path.split('.').map((s) => s.trim()).filter(Boolean);
+        const periphTok = (parts[0] ?? '').toLowerCase();
+        const regTok = parts[1]?.toLowerCase();
+        if (!periphTok) {
+            throw new Error('path must start with a peripheral name, e.g. "ETH.MACCR" or "RCC".');
+        }
+
+        // Candidate peripherals: exact name, else name-prefix or groupName match.
+        let candidates = model.peripherals.filter((p) => p.name.toLowerCase() === periphTok);
+        if (candidates.length === 0) {
+            candidates = model.peripherals.filter(
+                (p) => p.name.toLowerCase().startsWith(periphTok) || p.groupName?.toLowerCase() === periphTok,
+            );
+        }
+        if (candidates.length === 0) {
+            const names = model.peripherals.map((p) => p.name).slice(0, 40).join(', ');
+            throw new Error(`No peripheral matching "${parts[0]}". Available include: ${names}…`);
+        }
+
+        if (regTok) {
+            const matches: Array<{ p: SvdPeripheral; reg: SvdRegister }> = [];
+            for (const p of candidates) {
+                const reg = p.registers.find((r) => r.name.toLowerCase() === regTok);
+                if (reg) {
+                    matches.push({ p, reg });
+                }
+            }
+            if (matches.length === 0) {
+                throw new Error(`No register "${parts[1]}" in ${candidates.map((p) => p.name).join(' / ')}.`);
+            }
+            if (matches.length > 1) {
+                throw new Error(`Ambiguous register "${parts[1]}": ${matches.map((m) => `${m.p.name}.${m.reg.name}`).join(', ')}. Use the full peripheral name.`);
+            }
+            return await this.readDecodeRegister(session, matches[0].p, matches[0].reg);
+        }
+
+        // Peripheral / group overview. Read live values only for a single peripheral
+        // (a group could be many peripherals × many registers).
+        const cap = payload.maxRegisters ?? 48;
+        const single = candidates.length === 1;
+        const out: any[] = [];
+        for (const p of candidates) {
+            const registers: any[] = [];
+            for (const r of p.registers.slice(0, cap)) {
+                const addr = (p.baseAddress + r.addressOffset) >>> 0;
+                const entry: any = { name: r.name, address: hex32(addr) };
+                if (single) {
+                    try {
+                        const v = await this.readRegisterValue(session, addr, r.size);
+                        entry.value = '0x' + v.toString(16).padStart(Math.ceil(r.size / 4), '0');
+                    } catch {
+                        // best-effort
+                    }
+                }
+                registers.push(entry);
+            }
+            out.push({
+                peripheral: p.name,
+                base: hex32(p.baseAddress),
+                description: p.description,
+                registerCount: p.registers.length,
+                truncated: p.registers.length > cap,
+                registers,
+            });
+        }
+        if (single) {
+            return out[0];
+        }
+        return {
+            note: `${out.length} peripherals matched "${parts[0]}" — values omitted for a group; query a specific PERIPH or PERIPH.REG for live values.`,
+            matched: out,
+        };
     }
 
     /** Read a little-endian u32 from an absolute address (frame-independent). */

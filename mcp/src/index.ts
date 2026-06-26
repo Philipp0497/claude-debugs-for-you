@@ -159,6 +159,12 @@ and ARMv8-M Baseline (M23): HardFault-only — verdict from ICSR.VECTACTIVE + th
 the PRE-FAULT context (faulting PC/LR/xPSR + R0-R3/R12) from the stacked exception frame via EXC_RETURN,
 with the source line. Returns {fault:false} for a benign 'exception' stop. Call while stopped in the handler.`;
 
+const readPeripheralDescription = `Read and decode a memory-mapped peripheral register from the device
+SVD on the SHARED session. 'path' is "PERIPH.REG" to read one register and decode its bitfields (e.g.
+"ETH.MACCR" resolves to Ethernet_MAC.MACCR by group/prefix; "RCC.CR"), or "PERIPH" / a group or name
+prefix (e.g. "Ethernet_MMC", "ETH", "RCC") for a register overview. Field values are masked from the LIVE
+register read. Uses the launch.json svdFile (must be an .svd path, not a CMSIS-pack/device name).`;
+
 const inspectTcbDescription = `Inspect ThreadX threads on the SHARED session by walking the TCB list
 (_tx_thread_created_ptr). For each thread (or one by name): name, state, priority, run count, stack
 bounds, the saved stack pointer, and — for NON-running threads — a REAL top frame (saved PC decoded from
@@ -371,6 +377,18 @@ const tools = [
                 data: { type: "string", description: "Hex bytes to write, e.g. 'deadbeef' or 'de ad be ef'." }
             },
             required: ["address", "data"]
+        },
+    },
+    {
+        name: "read_peripheral",
+        description: readPeripheralDescription,
+        inputSchema: {
+            type: "object",
+            properties: {
+                path: { type: "string", description: "PERIPH.REG to decode one register, or PERIPH / group / name-prefix for an overview (e.g. 'ETH.MACCR', 'RCC', 'Ethernet_MMC')." },
+                maxRegisters: { type: "number", description: "Cap on registers in an overview (default 48)." }
+            },
+            required: ["path"]
         },
     },
     {

@@ -362,6 +362,39 @@ curl -s localhost:3333/tcp -H 'content-type: application/json' \
 
 ---
 
+## Feature 3 (Phase 6) — `read_peripheral` (SVD decode) — READY TO TEST
+
+The 20th tool. Decodes memory-mapped peripheral registers by name from the device SVD (`launch.json` `svdFile`), reusing the live `readMemory` path. Parser **validated offline against the real STM32F746.svd** (88 peripherals; `derivedFrom` inheritance; prefix/group resolution; 32-bit fields via BigInt).
+
+- **`read_peripheral {"path":"PERIPH.REG"}`** — read one register, decode its bitfields from the live value. `path` resolves by exact name, then **prefix/group** — so `"ETH.MACCR"` finds `Ethernet_MAC.MACCR` (there's no `ETH` peripheral; it's `Ethernet_MAC/MMC/PTP/DMA`).
+- **`read_peripheral {"path":"PERIPH"}`** — single peripheral → register overview **with live values** (cap 48, `maxRegisters` to raise). A group/prefix (e.g. `"ETH"`) → lists the matched peripherals (no values; query one for values).
+
+**Reload the dev host (Ctrl/Cmd+R)** first (restart the Claude session if on stdio MCP). Needs `svdFile` in your launch.json pointing at an `.svd` file.
+
+### Test it (stopped)
+
+```bash
+# Decode the MAC config register + cross-check against a raw read:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"read_peripheral","arguments":{"path":"ETH.MACCR"}}'
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"read_memory","arguments":{"address":"0x40028000","count":4}}'
+
+# The "is RX alive" oracle — MMC received-good-unicast counter (32-bit field):
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"read_peripheral","arguments":{"path":"Ethernet_MMC.MMCRGUFCR"}}'
+
+# Peripheral overview with live values:
+curl -s localhost:3333/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"read_peripheral","arguments":{"path":"RCC"}}'
+```
+
+### The gate (Feature 3)
+
+`read_peripheral "ETH.MACCR"` returns the value + decoded bits (`RE`/`TE`/…) and the `value` **matches** the raw `read_memory 0x40028000`; an MMC counter (`MMCRGUFCR` @`0x400281c4`) reads as a plausible 32-bit count (and increments if you poll across RX traffic); a peripheral overview (`RCC`) lists registers with live values. Directly serves the Ethernet/MAC bring-up (MMC counters as the RX/TX oracle).
+
+---
+
 ## If you hit something
 
 Report: what you evaluated, what the tool returned, and what the VS Code panel showed for the same thread/frame. That, plus whether the `stopped` event had a `threadId`, pinpoints it fast.
