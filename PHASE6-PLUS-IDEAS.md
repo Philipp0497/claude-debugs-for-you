@@ -82,9 +82,10 @@ touching VS Code.
 **DONE** (commit a33ed00): `start_session`/`restart_session`. HW-confirmed: recovered a session dead in
 MemManage_Handler to stopped-at-entry, no VS Code touch; race-hardened (session-scoped stop detection +
 waitForNewSession(excludeId)).
-**Follow-up refinement:** recovers to entry (Reset_Handler), not main. Add a `runToMain?: true` option
-(tbreak main → continue → wait for the main stop) so a workflow can resume *useful* firmware in one call
-instead of entry + a manual continue/breakpoint.
+**Follow-up refinement DONE** (commit 3b73ac6): `runToMain?: true` lands at main(). Root cause was
+upstream — `runToEntryPoint:"main"` makes cortex-debug auto-drive reset→main, and the transient reset halt
+latched isStopped stale. Fixed via a stable-stop (settled ≥400ms) + location-verified wait that doesn't
+fight the auto-drive, plus a tracker fix clearing isStopped on the bare reset halt's `continued`.
 
 ---
 
