@@ -1,174 +1,170 @@
-# <img src="./images/claude-debugs-for-you.png" width="64" height="64" alt="description" align="center"> Claude Debugs For You
+# Claude Debugs For You — Cortex / ThreadX edition
 
-[![Badge](https://img.shields.io/badge/Visual%20Studio%20Marketplace-0.1.2-blue.svg)](https://marketplace.visualstudio.com/items?itemName=JasonMcGhee.claude-debugs-for-you)
+> A fork of [jasonjmcghee/claude-debugs-for-you](https://github.com/jasonjmcghee/claude-debugs-for-you)
+> that turns it into a **shared, single-session pair-debugger** for **STM32 / Cortex-M** firmware
+> (cortex-debug + OpenOCD/J-Link + arm-none-eabi-gdb), with first-class **Azure RTOS / ThreadX** support.
 
-_aka Vibe Debugging_
+An [MCP](https://modelcontextprotocol.io) server + VS Code extension that lets an LLM (Claude, or any
+MCP client) **drive the same live debug session you're looking at**. The human steers from the VS Code
+UI and Claude steers via MCP tools on the **one** `vscode.debug.activeDebugSession` — no second GDB
+connection, no re-attach, no lost context. Hand the wheel back and forth freely.
 
-### Enable Claude (or any other LLM) to interactively debug your code
+The original upstream extension is language-agnostic (any DAP debugger with a valid `launch.json`); that
+still works. **This fork adds** the shared-session awareness and a deep Cortex-M / ThreadX forensics
+toolset on top.
 
-This is an [MCP](https://docs.anthropic.com/en/docs/build-with-claude/mcp) Server and VS Code extension which enables claude to interactively debug and evaluate expressions.
+---
 
-That means it should also work with other models / clients etc. but I only demonstrate it with Claude Desktop and Continue here.
+## What's different in this fork
 
-It's language-agnostic, assuming debugger console support and valid launch.json for debugging in VSCode.
+- **Shared single session.** Everything runs on `vscode.debug.activeDebugSession`. Claude's breakpoints
+  show up in your gutter; Claude's stepping moves your highlighted line; your manual steps/breakpoints
+  show up in Claude's `get_debug_state` — without telling it.
+- **Correct multi-thread (RTOS) frame/thread resolution.** The inspection path resolves the *actual*
+  stopped thread from the DAP `stopped` event instead of assuming thread 1 — the prerequisite for
+  anything useful on a ThreadX target.
+- **Relay-correct value reads.** Uses DAP `context:'watch'` (frame-pinned) for values; a separate
+  `gdb_exec` captures raw GDB CLI output from the debug console.
+- **A 20-tool surface** (below) spanning session control, inspection, Cortex-M forensics, ThreadX
+  introspection, and SVD peripheral decode.
+- **Three transports**, including **streamable-HTTP** (`/mcp`) for Claude Code, alongside stdio + SSE.
 
-## Getting Started
+Validated end-to-end on a **Nucleo-F746ZG** (Cortex-M7F) running ThreadX + NetX Duo.
 
-1. Download the extension from [releases](https://github.com/jasonjmcghee/claude-debugs-for-you/releases/) or [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=JasonMcGhee.claude-debugs-for-you)
-2. Install the extension
-  - If using `.vsix` directly, go to the three dots in "Extensions" in VS Code and choose "Install from VSIX..."
-3. You will see a new status menu item "Claude Debugs For You" which shows if it is running properly (check) or failed to startup (x)
+---
 
-<img width="314" alt="Screenshot 2025-03-22 at 9 51 22 PM" src="https://github.com/user-attachments/assets/2cd65e0d-4c1d-4fb6-b9ea-3995149b4043" />
+## Tool surface
 
-You can click this status menu for the commands available
+All tools operate on the shared session and are meant to be re-checked after the human may have acted
+(`get_debug_state`). Visible actions (breakpoints, stepping) use native VS Code APIs; invisible reads use
+DAP `customRequest` and are narrated in chat.
 
-<img width="510" alt="Screenshot 2025-03-22 at 9 59 22 PM" src="https://github.com/user-attachments/assets/54e339e3-81f8-4ef2-a201-6742aa2c97a8" />
+### Session & flow
 
-### Follow one of the options below, depending on your setup
+- `start_session` / `restart_session {config?, runToMain?}` — Claude (re)launches the cortex-debug
+  session itself and recovers a dead/faulted one; `runToMain:true` lands at `main()`.
+- `debug { steps: [...] }` — batch of: `setBreakpoint`, `removeBreakpoint`, `launch`, `continue`,
+  `stepOver`, `stepInto`, `stepOut`, `pause`, `evaluate` (bare expression, frame-pinned `watch`).
+- `get_debug_state` — running/stopped, stop reason, stopped thread, current location, all threads, all
+  breakpoints, and a log of recent actions tagged `human` / `claude`.
 
-<details>
-  <summary>If using stdio (classic, required for Claude Desktop)</summary>
+### Inspection
 
-4. Copy the stdio server path to your clipboard by searching vs code commands for "Copy MCP Debug Server stdio path to clipboard"
+- `get_stack {threadId?}` · `get_variables {threadId?, scope?}` · `get_registers {threadId?}`
+- `read_memory {address, count?}` · `write_memory {address, data}` (guarded)
+- `read_special_reg {name?, threadId?}` — `$msp/$psp/$control/$primask/$basepri/$faultmask`
+  (+ `$msplim/$psplim` on ARMv8-M). CPU-global regs are nulled for a non-current thread.
 
-5. Paste the following (BUT UPDATE THE PATH TO THE COPIED ONE!) in your `claude_desktop_config.json` or edit accordingly if you use other MCP servers
+### Threads
 
+- `list_threads` · `select_thread {threadId}`
+
+### Cortex-M forensics
+
+- `gdb_exec {command}` — raw GDB CLI (`info registers`, `x/16xw $sp`, `monitor reset halt`) with console
+  output captured.
+- `set_watchpoint {expression|expr, kind}` — hardware data watchpoint (`watch`/`rwatch`/`awatch`).
+- `explain_fault` — **core-aware** fault decoder. CPUID auto-detect; decodes CFSR/HFSR/MMFAR/BFAR
+  (+ `UFSR.STKOF` and SecureFault SFSR/SFAR on ARMv8-M); ARMv6-M / Cortex-M23 are HardFault-only. Recovers
+  the **pre-fault** context (faulting PC/LR/xPSR + R0-R3/R12) from the stacked exception frame.
+
+### ThreadX (Azure RTOS)
+
+- `inspect_tcb {name?}` — per thread: state, priority, run-count, stack bounds, **saved SP**, and for
+  non-running threads a **real top frame** decoded from the TCB saved context (bypasses the gdb-server's
+  RTOS unwinder).
+- `thread_stack_usage {name?}` — per-thread stack high-water via the `0xEFEFEFEF` fill scan.
+
+### Peripherals
+
+- `read_peripheral {path, maxRegisters?}` — decode a register's bitfields from the device SVD
+  (`launch.json` `svdFile`). `"ETH.MACCR"` resolves by prefix/group; `"RCC"` gives a live overview.
+
+### Workspace (from upstream)
+
+- `listFiles` · `getFileContent`
+
+---
+
+## Getting started
+
+This is currently run as a **development build** (not published to the Marketplace).
+
+1. Clone and build (builds the bundled MCP server + the extension):
+
+   ```bash
+   npm install && npm run compile
+   ```
+
+2. Open this repo in VS Code and press **F5** ("Run Extension") → a second VS Code window opens with the
+   extension loaded.
+3. In that window, open your firmware project (with a `cortex-debug` `launch.json`; set `svdFile` for
+   `read_peripheral`, and `-rtos ThreadX` in your OpenOCD config for ThreadX threads).
+4. Confirm the **"✓ Claude Debugs For You"** status-bar item (the MCP server is up; default port `4711`).
+   Click it for commands (start/stop, set port, copy transport address).
+
+### Connect your MCP client
+
+The status-bar menu has **Copy MCP HTTP address**, **Copy stdio path**, and **Copy SSE address**.
+
+**Claude Code (streamable-HTTP, recommended)** — run in your firmware repo:
+
+```bash
+claude mcp add --transport http debug http://localhost:4711/mcp --scope project
 ```
-{
-  "mcpServers": {
-    "debug": {
-      "command": "node",
-      "args": [
-        "/path/to/mcp-debug.js"
-      ]
-    }
-  }
-}
+
+Then `/mcp` to confirm `debug` is connected with the tools available.
+
+**stdio** (Claude Desktop, Continue, …):
+
+```jsonc
+{ "mcpServers": { "debug": { "command": "node", "args": ["/path/from/Copy stdio path"] } } }
 ```
 
-6. Start Claude desktop (or other MCP client)
-    1. Note: You may need to restart it, if it was already running.
-    2. You can skip this step if using Continue/Cursor or other built-in to VS Code
-</details>
+**SSE**: use `http://localhost:4711/sse` (legacy; HTTP preferred).
 
-<details>
-  <summary>If using `/sse` (e.g. Cursor)</summary>
+The extension must be running (status-bar ✓) for any transport — stdio/SSE proxy to its HTTP server.
 
-4. Retrieve the MCP server sse address by using the "Copy MCP Debug Server sse address to clipboard" command
-    1. You can just write it out server URL of "http://localhost:4711/sse", or whatever port you setup in settings.
-5. Add it wherever you need to based on your client
-    1. You may need to hit "refresh" depending on client: this is required in Cursor
-6. Start MCP client
-   1. Note: You may need to restart it, if it was already running.
-   2. You can skip this step if using Continue/Cursor or other built-in to VS Code
+---
 
-</details>
+## Quick smoke test (no MCP client needed)
 
-### You're ready to debug!
+While stopped at a breakpoint, the legacy `/tcp` endpoint exercises a tool directly:
 
-_[VS Code Debugging Documentation](https://code.visualstudio.com/Docs/editor/debugging)_
+```bash
+curl -s localhost:4711/tcp -H 'content-type: application/json' \
+  -d '{"type":"callTool","tool":"get_debug_state","arguments":{}}' | python3 -m json.tool
+```
 
-Open a project containing a `.vscode/launch.json` with the first configuration setup to debug a specific file with `${file}`.
-
-See [Run  an Example](#run-an-example) below, and/or watch a demo video.
-
-## Contributing
-
-Find bugs or have an idea that will improve this? Please open a pull request or log an issue.
-
-Does this readme suck? Help me improve it!
-
-## Demo
-
-### Using [Continue](https://github.com/continuedev/continue)
-
-It figures out the problem, and then suggests a fix, which we just click to apply
-
-https://github.com/user-attachments/assets/3a0a879d-2db7-4a3f-ab43-796c22a0f1ef
-
-<details>
-  <summary>How do I set this up with Continue? / Show MCP Configuration</summary>
-
-  [Read the docs!](https://docs.continue.dev/customize/tools)
-
-  Configuration:
-  
-  ```json
-  {
-    ...
-    "experimental": {
-      "modelContextProtocolServers": [
-        {
-          "transport": {
-            "type": "stdio",
-            "command": "node",
-            "args": [
-              "/Users/jason/Library/Application Support/Code/User/globalStorage/jasonmcghee.claude-debugs-for-you/mcp-debug.js"
-            ]
-          }
-        }
-      ]
-    }
-  }
-  ```
-
-  You'll also need to choose a model capable of using tools.
-
-  When the list of tools pops up, make sure to click "debug" in the list of your tools, and set it to be "Automatic".
-
-  ### Troubleshooting
-
-  If you are seeing MCP errors in continue, try disabling / re-enabling the continue plugin
-
-</details>
-
-If helpful, this is what my configuration looks like! But it's nearly the same as Claude Desktop.
-
-
-### Using Claude Desktop
-
-In this example, I made it intentionally very cautious (make no assumptions etc - same prompt as below) but you can ask it to do whatever.
-
-https://github.com/user-attachments/assets/ef6085f7-11a2-4eea-bb60-b5a54873b5d5
+---
 
 ## Developing
 
-- Clone / Open this repo with VS Code
-- Run `npm run install` and `npm run compile`
-- Hit "run" which will open a new VSCode
-- Otherwise same as "Getting Started applies"
-- To rebuild, `npm run compile`
+- `npm run compile` rebuilds the bundled MCP server (`mcp/`) and the extension (`out/`).
+- Reload the Extension Development Host (Ctrl/Cmd+R) to pick up a rebuild.
+- Dependencies of note: `@modelcontextprotocol/sdk` (pinned alongside `zod` v3 — they must share one zod),
+  `fast-xml-parser` (SVD parsing).
 
-## Package
+### Package
 
 ```bash
-vsce package
+npx @vscode/vsce package
 ```
 
+---
 
-## Run an Example
+## Notes & caveats
 
-Open `examples/python` in a VS Code window
+- **Generic targets**: the session/flow/inspection tools are debugger-agnostic; the forensics, ThreadX,
+  and peripheral tools are Cortex-M / ThreadX specific and degrade with a clear note elsewhere.
+- **`runToEntryPoint:"main"`**: with this set, cortex-debug auto-drives reset→main; the tools account for
+  the transient reset halt.
+- **Cross-core `explain_fault`**: validated on Cortex-M7; the ARMv6-M (M0+) and ARMv8-M (M33) paths are
+  implemented but await testing on that silicon.
 
-Enter the prompt:
+## Credit
 
-```
-i am building `longest_substring_with_k_distinct` and for some reason it's not working quite right. can you debug it step by step using breakpoints and evaluating expressions to figure out where it goes wrong? make sure to use the debug tool to get access and debug! don't make any guesses as to the problem up front. DEBUG!
-```
-
-## Other things worth mentioning
-
-When you start multiple vs code windows, you'll see a pop-up. You can gracefully hand-off "Claude Debugs For You" between windows.
-
-You can also disable autostart. Then you'll just need to click the status menu and select "Start Server".
-
-<img width="395" alt="Screenshot 2025-03-22 at 10 08 52 PM" src="https://github.com/user-attachments/assets/2b6d1b61-a2c6-4447-8054-b4dd02a716e8" />
-
-
-## Short list of ideas
-
-- [ ] It should use ripgrep to find what you ask for, rather than list files + get file content.
-- [x] Add support for conditional breakpoints
-- [ ] Add "fix" tool by allowing MCP to insert a CodeLens or "auto fix" suggestion so the user can choose to apply a recommended change or not.
-- Your idea here!
+Forked from **[jasonjmcghee/claude-debugs-for-you](https://github.com/jasonjmcghee/claude-debugs-for-you)**
+by Jason McGhee. The upstream project provides the MCP-server-in-extension architecture, the
+files/get-content/`debug` tools, and the multi-window handoff. This fork adds the shared-session
+awareness, the Cortex-M / ThreadX forensics toolset, and the streamable-HTTP transport.
