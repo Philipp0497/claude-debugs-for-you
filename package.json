@@ -1,9 +1,13 @@
 {
   "name": "claude-debugs-for-you",
   "displayName": "Claude Debugs for You",
-  "description": "Enable an MCP Client, such as Claude Desktop to directly debug code with breakpoints",
+  "description": "Shared single-session MCP pair-debugger for STM32 / Cortex-M / ThreadX (fork of jasonjmcghee/claude-debugs-for-you).",
   "version": "0.1.2",
-  "repository": "https://github.com/jasonjmcghee/claude-debugs-for-you",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Philipp0497/claude-debugs-for-you.git"
+  },
   "author": "Jason McGhee",
   "publisher": "JasonMcGhee",
   "icon": "images/claude-debugs-for-you.png",

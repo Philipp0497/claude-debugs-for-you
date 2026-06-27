@@ -8,7 +8,9 @@ src/**
 **/*.map
 **/*.ts
 **/.vscode-test.*
-*.visx
+*.vsix
 mcp/**
 !mcp/build/index.js
 .idea
+PHASE1-HANDOVER.md
+PHASE6-PLUS-IDEAS.md
