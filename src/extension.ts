@@ -38,6 +38,10 @@ export function activate(context: vscode.ExtensionContext) {
 
     const server = new DebugServer(port, portConfigPath, sessionTracker);
 
+    // Release the HTTP port when the extension host disposes us (deactivate()
+    // is not guaranteed to run on every teardown path; a subscription is).
+    context.subscriptions.push({ dispose: () => { void server.stop(); } });
+
     // Create status bar item
     const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right);
     statusBarItem.command = 'claude-debugs-for-you.showCommands';

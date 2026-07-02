@@ -3,13 +3,7 @@ import * as http from 'http';
 import * as vscode from 'vscode';
 import { EventEmitter } from 'events';
 import { z } from 'zod';
-
-interface DebugServerEvents {
-    on(event: 'started', listener: () => void): this;
-    on(event: 'stopped', listener: () => void): this;
-    emit(event: 'started'): boolean;
-    emit(event: 'stopped'): boolean;
-}
+import { zodToJsonSchema } from 'zod-to-json-schema';
 import { randomUUID } from 'crypto';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
@@ -18,10 +12,16 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { SessionStateTracker } from './session-state';
 import { parseSvd, SvdModel, SvdPeripheral, SvdRegister } from './svd';
+import {
+    hex32, coreFromCpuid, FAULT_EXCEPTIONS, decodeFaultFlags, decodeExcReturn,
+    decodeStackedFrame, savedPcOffsetFromExcReturn, TX_STATE_NAMES, scanStackHighWater,
+} from './cortex-decode';
 
-export interface DebugCommand {
-    command: 'listFiles' | 'getFileContent' | 'debug';
-    payload: any;
+interface DebugServerEvents {
+    on(event: 'started', listener: () => void): this;
+    on(event: 'stopped', listener: () => void): this;
+    emit(event: 'started'): boolean;
+    emit(event: 'stopped'): boolean;
 }
 
 export interface DebugStep {
@@ -181,7 +181,7 @@ Requires ThreadX debug symbols; only meaningful while stopped.`;
 
 const threadStackUsageDescription = `Report per-thread ThreadX stack high-water usage on the SHARED
 session by scanning each stack for the 0xEFEFEFEF fill pattern (written at thread create unless
-TX_DISABLE_STACK_FILLING). Returns size, peak-used, free, and peak%% per thread (or one by name) — an
+TX_DISABLE_STACK_FILLING). Returns size, peak-used, free, and peak% per thread (or one by name) — an
 early-warning for stack overflow. Requires ThreadX symbols and stack filling enabled.`;
 
 const inspectTcbInputSchema = {
@@ -226,46 +226,6 @@ const SPECIAL_REGS = ['sp', 'lr', 'pc', 'xpsr', 'msp', 'psp', 'primask', 'basepr
 // are per-thread (note: non-current unwinds depend on the gdb-server's RTOS support).
 const GLOBAL_ONLY_REGS = new Set(['msp', 'psp', 'control', 'primask', 'basepri', 'faultmask', 'msplim', 'psplim']);
 
-// CPUID PartNo (bits[15:4]) -> core capabilities. configurableFaults = has the
-// CFSR/HFSR/MMFAR/BFAR block (ARMv7-M and ARMv8-M Mainline). v8m = ARMv8-M (adds
-// UFSR.STKOF + SecureFault SFSR/SFAR). NOTE: Cortex-M23 is v8-M but HardFault-only,
-// so capability is keyed per-part, NOT off v8m.
-const CORTEX_CORES: Record<number, { name: string; configurableFaults: boolean; v8m: boolean }> = {
-    0xc20: { name: 'Cortex-M0', configurableFaults: false, v8m: false },
-    0xc60: { name: 'Cortex-M0+', configurableFaults: false, v8m: false },
-    0xc21: { name: 'Cortex-M1', configurableFaults: false, v8m: false },
-    0xc23: { name: 'Cortex-M3', configurableFaults: true, v8m: false },
-    0xc24: { name: 'Cortex-M4', configurableFaults: true, v8m: false },
-    0xc27: { name: 'Cortex-M7', configurableFaults: true, v8m: false },
-    0xd20: { name: 'Cortex-M23', configurableFaults: false, v8m: true },
-    0xd21: { name: 'Cortex-M33', configurableFaults: true, v8m: true },
-    0xd22: { name: 'Cortex-M55', configurableFaults: true, v8m: true },
-    0xd23: { name: 'Cortex-M85', configurableFaults: true, v8m: true },
-    0xd31: { name: 'Cortex-M35P', configurableFaults: true, v8m: true },
-};
-
-// ICSR.VECTACTIVE exception numbers that are CPU faults.
-const FAULT_EXCEPTIONS: Record<number, string> = {
-    3: 'HardFault',
-    4: 'MemManage',
-    5: 'BusFault',
-    6: 'UsageFault',
-    7: 'SecureFault',
-};
-
-function hex32(n: number): string {
-    return '0x' + (n >>> 0).toString(16).padStart(8, '0');
-}
-
-// ThreadX tx_thread_state values (Azure RTOS / Eclipse ThreadX, tx_api.h).
-const TX_STATE_NAMES = [
-    'READY', 'COMPLETED', 'TERMINATED', 'SUSPENDED', 'SLEEP', 'QUEUE_SUSP',
-    'SEMAPHORE_SUSP', 'EVENT_FLAG', 'BLOCK_MEMORY', 'BYTE_MEMORY', 'IO_DRIVER',
-    'FILE', 'TCP_IP', 'MUTEX_SUSP', 'PRIORITY_CHANGE',
-];
-// Default ThreadX stack fill word (filled at create unless TX_DISABLE_STACK_FILLING).
-const TX_STACK_FILL = 0xefefefef;
-
 const listFilesInputSchema = {
     includePatterns: z.array(z.string()).describe("Glob patterns to include (e.g. ['**/*.js'])").optional(),
     excludePatterns: z.array(z.string()).describe("Glob patterns to exclude (e.g. ['node_modules/**'])").optional(),
@@ -277,7 +237,7 @@ const getFileContentInputSchema = {
 
 const debugStepSchema = z.object({
     type: z.enum(["setBreakpoint", "removeBreakpoint", "continue", "evaluate", "launch", "stepOver", "stepInto", "stepOut", "pause"]).describe(""),
-    file: z.string().describe("File path. Required for setBreakpoint and launch; ignored by flow-control/evaluate steps.").optional(),
+    file: z.string().describe("File path. Required for setBreakpoint and launch; recommended for removeBreakpoint (without it, a breakpoint on that line in ANY file matches); ignored by flow-control/evaluate steps.").optional(),
     line: z.number().optional(),
     expression: z.string().describe("A bare expression to evaluate in the resolved stopped frame (e.g. a variable name, '&symbol', '$pc', '$sp'). NOT a debugger CLI command: 'p/x ...', 'info registers', 'x/...', 'monitor ...' are not supported here. For hex output append a ',x' format suffix (e.g. 'value,x').").optional(),
     condition: z.string().describe("If needed, a breakpoint condition may be specified to only stop on a breakpoint for some given condition.").optional(),
@@ -287,109 +247,56 @@ const debugInputSchema = {
     steps: z.array(debugStepSchema),
 };
 
-// Main tools array with Zod schemas
-const tools = [
-    {
-        name: "listFiles",
-        description: listFilesDescription, // Make sure this variable is defined in your code
-        inputSchema: listFilesInputSchema,
-    },
-    {
-        name: "getFileContent",
-        description: getFileContentDescription, // Make sure this variable is defined in your code
-        inputSchema: getFileContentInputSchema,
-    },
-    {
-        name: "debug",
-        description: debugDescription, // Make sure this variable is defined in your code
-        inputSchema: debugInputSchema,
-    },
-    {
-        name: "get_debug_state",
-        description: getDebugStateDescription,
-        inputSchema: getDebugStateInputSchema,
-    },
-    {
-        name: "gdb_exec",
-        description: gdbExecDescription,
-        inputSchema: gdbExecInputSchema,
-    },
-    {
-        name: "read_special_reg",
-        description: readSpecialRegDescription,
-        inputSchema: readSpecialRegInputSchema,
-    },
-    {
-        name: "set_watchpoint",
-        description: setWatchpointDescription,
-        inputSchema: setWatchpointInputSchema,
-    },
-    {
-        name: "list_threads",
-        description: listThreadsDescription,
-        inputSchema: listThreadsInputSchema,
-    },
-    {
-        name: "select_thread",
-        description: selectThreadDescription,
-        inputSchema: selectThreadInputSchema,
-    },
-    {
-        name: "get_stack",
-        description: getStackDescription,
-        inputSchema: getStackInputSchema,
-    },
-    {
-        name: "get_registers",
-        description: getRegistersDescription,
-        inputSchema: getRegistersInputSchema,
-    },
-    {
-        name: "get_variables",
-        description: getVariablesDescription,
-        inputSchema: getVariablesInputSchema,
-    },
-    {
-        name: "read_memory",
-        description: readMemoryDescription,
-        inputSchema: readMemoryInputSchema,
-    },
-    {
-        name: "write_memory",
-        description: writeMemoryDescription,
-        inputSchema: writeMemoryInputSchema,
-    },
-    {
-        name: "read_peripheral",
-        description: readPeripheralDescription,
-        inputSchema: readPeripheralInputSchema,
-    },
-    {
-        name: "explain_fault",
-        description: explainFaultDescription,
-        inputSchema: explainFaultInputSchema,
-    },
-    {
-        name: "inspect_tcb",
-        description: inspectTcbDescription,
-        inputSchema: inspectTcbInputSchema,
-    },
-    {
-        name: "thread_stack_usage",
-        description: threadStackUsageDescription,
-        inputSchema: threadStackUsageInputSchema,
-    },
-    {
-        name: "start_session",
-        description: startSessionDescription,
-        inputSchema: startSessionInputSchema,
-    },
-    {
-        name: "restart_session",
-        description: restartSessionDescription,
-        inputSchema: restartSessionInputSchema,
-    },
-];
+/**
+ * One entry in the SINGLE tool registry. Everything tool-related is derived
+ * from this: the per-session McpServer registrations (stdio/SSE/HTTP), the
+ * legacy /tcp callTool dispatch, and the /tcp listTools JSON schemas (which
+ * the stdio proxy re-serves verbatim). Add a tool here and every transport
+ * gets it — there is deliberately no second list to keep in sync.
+ */
+interface RegisteredTool {
+    name: string;
+    description: string;
+    schema: z.ZodRawShape;
+    handler: (args: any) => Promise<any>;
+}
+
+/** Uniform MCP text rendering of a tool result (raw results go over /tcp). */
+function formatToolResult(result: any): string {
+    if (typeof result === 'string') {
+        return result;
+    }
+    if (Array.isArray(result) && result.length > 0 && result.every((x) => typeof x === 'string')) {
+        return result.join('\n');
+    }
+    return JSON.stringify(result, null, 2);
+}
+
+// The server is a LOCAL pairing tool: it can flash/halt hardware, write target
+// memory, and read workspace files. It binds to 127.0.0.1 only; these checks
+// add defense in depth against DNS rebinding (a foreign Host resolving to
+// 127.0.0.1) and browser drive-by requests (a web page POSTing to localhost).
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+
+function isLocalHostHeader(host: string | undefined): boolean {
+    if (!host) {
+        return true; // no Host header = not a browser; the socket is local-only anyway
+    }
+    try {
+        return LOCAL_HOSTNAMES.has(new URL(`http://${host}`).hostname);
+    } catch {
+        return false;
+    }
+}
+
+function isLocalOrigin(origin: string): boolean {
+    try {
+        return LOCAL_HOSTNAMES.has(new URL(origin).hostname);
+    } catch {
+        return false; // includes the opaque 'null' origin
+    }
+}
+
 export class DebugServer extends EventEmitter implements DebugServerEvents {
     private server: net.Server | null = null;
     private port: number = 4711;
@@ -401,6 +308,8 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
     private tracker: SessionStateTracker;
     private svdCache: { path: string; mtimeMs: number; model: SvdModel } | undefined;
 
+    private readonly toolRegistry: RegisteredTool[];
+
     constructor(port: number | undefined, portConfigPath: string | undefined, tracker: SessionStateTracker) {
         super();
         this.port = port || 4711;
@@ -410,11 +319,47 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         // an unregistered tracker would have an empty state map and silently
         // degrade resolution back to the wrong-thread bug this fork removes.
         this.tracker = tracker;
+        this.toolRegistry = this.buildToolRegistry();
         this.mcpServer = this.createMcpServer();
     }
 
+    /** The single source of truth for the tool surface (see RegisteredTool). */
+    private buildToolRegistry(): RegisteredTool[] {
+        return [
+            { name: 'listFiles', description: listFilesDescription, schema: listFilesInputSchema, handler: (a) => this.handleListFiles(a) },
+            { name: 'getFileContent', description: getFileContentDescription, schema: getFileContentInputSchema, handler: (a) => this.handleGetFile(a) },
+            { name: 'debug', description: debugDescription, schema: debugInputSchema, handler: (a) => this.handleDebug(a) },
+            { name: 'get_debug_state', description: getDebugStateDescription, schema: getDebugStateInputSchema, handler: () => this.handleGetDebugState() },
+            { name: 'gdb_exec', description: gdbExecDescription, schema: gdbExecInputSchema, handler: (a) => this.handleGdbExec(a) },
+            { name: 'read_special_reg', description: readSpecialRegDescription, schema: readSpecialRegInputSchema, handler: (a) => this.handleReadSpecialReg(a) },
+            { name: 'set_watchpoint', description: setWatchpointDescription, schema: setWatchpointInputSchema, handler: (a) => this.handleSetWatchpoint(a) },
+            { name: 'list_threads', description: listThreadsDescription, schema: listThreadsInputSchema, handler: () => this.handleListThreads() },
+            { name: 'select_thread', description: selectThreadDescription, schema: selectThreadInputSchema, handler: (a) => this.handleSelectThread(a) },
+            { name: 'get_stack', description: getStackDescription, schema: getStackInputSchema, handler: (a) => this.handleGetStack(a) },
+            { name: 'get_registers', description: getRegistersDescription, schema: getRegistersInputSchema, handler: (a) => this.handleGetRegisters(a) },
+            { name: 'get_variables', description: getVariablesDescription, schema: getVariablesInputSchema, handler: (a) => this.handleGetVariables(a) },
+            { name: 'read_memory', description: readMemoryDescription, schema: readMemoryInputSchema, handler: (a) => this.handleReadMemory(a) },
+            { name: 'write_memory', description: writeMemoryDescription, schema: writeMemoryInputSchema, handler: (a) => this.handleWriteMemory(a) },
+            { name: 'read_peripheral', description: readPeripheralDescription, schema: readPeripheralInputSchema, handler: (a) => this.handleReadPeripheral(a) },
+            { name: 'explain_fault', description: explainFaultDescription, schema: explainFaultInputSchema, handler: () => this.handleExplainFault() },
+            { name: 'inspect_tcb', description: inspectTcbDescription, schema: inspectTcbInputSchema, handler: (a) => this.handleInspectTcb(a) },
+            { name: 'thread_stack_usage', description: threadStackUsageDescription, schema: threadStackUsageInputSchema, handler: (a) => this.handleThreadStackUsage(a) },
+            { name: 'start_session', description: startSessionDescription, schema: startSessionInputSchema, handler: (a) => this.handleSessionLaunch(a, false) },
+            { name: 'restart_session', description: restartSessionDescription, schema: restartSessionInputSchema, handler: (a) => this.handleSessionLaunch(a, true) },
+        ];
+    }
+
+    /** Tool list with JSON schemas for /tcp listTools (served to the stdio proxy). */
+    private listToolsJson(): any[] {
+        return this.toolRegistry.map((t) => {
+            // zodToJsonSchema emits a $schema key; MCP inputSchema is a bare object schema.
+            const { $schema, ...inputSchema } = zodToJsonSchema(z.object(t.schema)) as any;
+            return { name: t.name, description: t.description, inputSchema };
+        });
+    }
+
     /**
-     * Build an McpServer with every tool registered against this DebugServer's
+     * Build an McpServer with every registry tool bound to this DebugServer's
      * handlers. A fresh instance is used PER streamable-HTTP session, because the
      * SDK's Protocol binds a single `_transport` per server and routes all
      * responses through it — one server cannot correctly serve concurrent
@@ -426,107 +371,11 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             name: "Debug Server",
             version: "1.0.0",
         });
-
-        server.tool("listFiles", listFilesDescription, listFilesInputSchema, async (args: any) => {
-            const files = await this.handleListFiles(args);
-            return { content: [{ type: "text", text: JSON.stringify(files) }] };
-        });
-
-        server.tool("getFileContent", getFileContentDescription, getFileContentInputSchema, async (args: any) => {
-            const content = await this.handleGetFile(args);
-            return { content: [{ type: "text", text: content }] };
-        });
-
-        server.tool("debug", debugDescription, debugInputSchema, async (args: any) => {
-            const results = await this.handleDebug(args);
-            return { content: [{ type: "text", text: results.join('\n') }] };
-        });
-
-        server.tool("get_debug_state", getDebugStateDescription, getDebugStateInputSchema, async () => {
-            const state = await this.handleGetDebugState();
-            return { content: [{ type: "text", text: JSON.stringify(state, null, 2) }] };
-        });
-
-        server.tool("gdb_exec", gdbExecDescription, gdbExecInputSchema, async (args: any) => {
-            const out = await this.handleGdbExec(args);
-            return { content: [{ type: "text", text: out }] };
-        });
-
-        server.tool("read_special_reg", readSpecialRegDescription, readSpecialRegInputSchema, async (args: any) => {
-            const regs = await this.handleReadSpecialReg(args);
-            return { content: [{ type: "text", text: JSON.stringify(regs, null, 2) }] };
-        });
-
-        server.tool("set_watchpoint", setWatchpointDescription, setWatchpointInputSchema, async (args: any) => {
-            const result = await this.handleSetWatchpoint(args);
-            return { content: [{ type: "text", text: result }] };
-        });
-
-        server.tool("list_threads", listThreadsDescription, listThreadsInputSchema, async () => {
-            const threads = await this.handleListThreads();
-            return { content: [{ type: "text", text: JSON.stringify(threads, null, 2) }] };
-        });
-
-        server.tool("select_thread", selectThreadDescription, selectThreadInputSchema, async (args: any) => {
-            const result = await this.handleSelectThread(args);
-            return { content: [{ type: "text", text: result }] };
-        });
-
-        server.tool("get_stack", getStackDescription, getStackInputSchema, async (args: any) => {
-            const stack = await this.handleGetStack(args);
-            return { content: [{ type: "text", text: JSON.stringify(stack, null, 2) }] };
-        });
-
-        server.tool("get_registers", getRegistersDescription, getRegistersInputSchema, async (args: any) => {
-            const regs = await this.handleGetRegisters(args);
-            return { content: [{ type: "text", text: JSON.stringify(regs, null, 2) }] };
-        });
-
-        server.tool("get_variables", getVariablesDescription, getVariablesInputSchema, async (args: any) => {
-            const vars = await this.handleGetVariables(args);
-            return { content: [{ type: "text", text: JSON.stringify(vars, null, 2) }] };
-        });
-
-        server.tool("read_memory", readMemoryDescription, readMemoryInputSchema, async (args: any) => {
-            const mem = await this.handleReadMemory(args);
-            return { content: [{ type: "text", text: JSON.stringify(mem, null, 2) }] };
-        });
-
-        server.tool("write_memory", writeMemoryDescription, writeMemoryInputSchema, async (args: any) => {
-            const result = await this.handleWriteMemory(args);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        });
-
-        server.tool("read_peripheral", readPeripheralDescription, readPeripheralInputSchema, async (args: any) => {
-            const result = await this.handleReadPeripheral(args);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        });
-
-        server.tool("explain_fault", explainFaultDescription, explainFaultInputSchema, async () => {
-            const result = await this.handleExplainFault();
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        });
-
-        server.tool("inspect_tcb", inspectTcbDescription, inspectTcbInputSchema, async (args: any) => {
-            const result = await this.handleInspectTcb(args);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        });
-
-        server.tool("thread_stack_usage", threadStackUsageDescription, threadStackUsageInputSchema, async (args: any) => {
-            const result = await this.handleThreadStackUsage(args);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        });
-
-        server.tool("start_session", startSessionDescription, startSessionInputSchema, async (args: any) => {
-            const result = await this.handleSessionLaunch(args, false);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        });
-
-        server.tool("restart_session", restartSessionDescription, restartSessionInputSchema, async (args: any) => {
-            const result = await this.handleSessionLaunch(args, true);
-            return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-        });
-
+        for (const tool of this.toolRegistry) {
+            server.tool(tool.name, tool.description, tool.schema, async (args: any) => ({
+                content: [{ type: 'text' as const, text: formatToolResult(await tool.handler(args)) }],
+            }));
+        }
         return server;
     }
 
@@ -604,11 +453,26 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         }
 
         this.server = http.createServer(async (req, res) => {
-            // Handle CORS
-            res.setHeader('Access-Control-Allow-Origin', '*');
-            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-            res.setHeader('Access-Control-Allow-Headers', '*');
-            res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
+            // Local-only guards (see LOCAL_HOSTNAMES): reject DNS rebinding and
+            // browser drive-by requests before touching any endpoint.
+            if (!isLocalHostHeader(req.headers.host)) {
+                res.writeHead(403).end('Forbidden: non-local Host');
+                return;
+            }
+            const origin = req.headers.origin;
+            if (origin !== undefined && !isLocalOrigin(origin)) {
+                res.writeHead(403).end('Forbidden: non-local Origin');
+                return;
+            }
+
+            // CORS: reflect only a verified-local Origin (e.g. a browser-based
+            // MCP inspector); non-browser clients send no Origin and need none.
+            if (origin) {
+                res.setHeader('Access-Control-Allow-Origin', origin);
+                res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+                res.setHeader('Access-Control-Allow-Headers', '*');
+                res.setHeader('Access-Control-Expose-Headers', 'mcp-session-id');
+            }
 
             if (req.method === 'OPTIONS') {
                 res.writeHead(204).end();
@@ -634,7 +498,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
                         let response: any;
 
                         if (request.type === 'listTools') {
-                            response = { tools };
+                            response = { tools: this.listToolsJson() };
                         } else if (request.type === 'callTool') {
                             response = await this.handleCommand(request);
                         }
@@ -685,7 +549,9 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         });
 
         return new Promise((resolve, reject) => {
-            this.server!.listen(this.port, () => {
+            // Loopback only: the tools reach live hardware and workspace files,
+            // so the server must never be reachable from the network.
+            this.server!.listen(this.port, '127.0.0.1', () => {
                 this._isRunning = true;
                 this.emit('started');
                 resolve();
@@ -740,52 +606,13 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         await transport.handleRequest(req, res);
     }
 
-    // Helper method to handle tool calls
+    /** /tcp callTool dispatch: look the tool up in the registry, return the RAW result. */
     private async handleCommand(request: ToolRequest): Promise<any> {
-        switch (request.tool) {
-            case 'listFiles':
-                return await this.handleListFiles(request.arguments);
-            case 'getFileContent':
-                return await this.handleGetFile(request.arguments);
-            case 'debug':
-                return await this.handleDebug(request.arguments);
-            case 'get_debug_state':
-                return await this.handleGetDebugState();
-            case 'gdb_exec':
-                return await this.handleGdbExec(request.arguments);
-            case 'read_special_reg':
-                return await this.handleReadSpecialReg(request.arguments);
-            case 'set_watchpoint':
-                return await this.handleSetWatchpoint(request.arguments);
-            case 'list_threads':
-                return await this.handleListThreads();
-            case 'select_thread':
-                return await this.handleSelectThread(request.arguments);
-            case 'get_stack':
-                return await this.handleGetStack(request.arguments);
-            case 'get_registers':
-                return await this.handleGetRegisters(request.arguments);
-            case 'get_variables':
-                return await this.handleGetVariables(request.arguments);
-            case 'read_memory':
-                return await this.handleReadMemory(request.arguments);
-            case 'write_memory':
-                return await this.handleWriteMemory(request.arguments);
-            case 'read_peripheral':
-                return await this.handleReadPeripheral(request.arguments);
-            case 'explain_fault':
-                return await this.handleExplainFault();
-            case 'inspect_tcb':
-                return await this.handleInspectTcb(request.arguments);
-            case 'thread_stack_usage':
-                return await this.handleThreadStackUsage(request.arguments);
-            case 'start_session':
-                return await this.handleSessionLaunch(request.arguments, false);
-            case 'restart_session':
-                return await this.handleSessionLaunch(request.arguments, true);
-            default:
-                throw new Error(`Unknown tool: ${request.tool}`);
+        const tool = this.toolRegistry.find((t) => t.name === request.tool);
+        if (!tool) {
+            throw new Error(`Unknown tool: ${request.tool}`);
         }
+        return await tool.handler(request.arguments);
     }
 
     private async handleLaunch(payload: {
@@ -1544,11 +1371,11 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
      */
     private async savedThreadPc(session: vscode.DebugSession, stackPtr: number): Promise<number | undefined> {
         try {
-            const lr = await this.readU32(session, stackPtr);
-            if ((lr >>> 24) !== 0xff) {
+            const firstWord = await this.readU32(session, stackPtr);
+            const pcOffset = savedPcOffsetFromExcReturn(firstWord);
+            if (pcOffset === undefined) {
                 return undefined; // not an EXC_RETURN-first frame — unknown port layout
             }
-            const pcOffset = (lr & 0x10) ? 60 : 124; // non-FP : FP
             const pc = await this.readU32(session, stackPtr + pcOffset);
             return pc & ~1; // clear the Thumb bit for symbolization
         } catch {
@@ -1635,29 +1462,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
     private async stackHighWater(session: vscode.DebugSession, start: number, size: number): Promise<any> {
         const resp = await session.customRequest('readMemory', { memoryReference: hex32(start), offset: 0, count: size });
         const data = resp?.data ? Buffer.from(resp.data, 'base64') : Buffer.alloc(0);
-        const words = Math.floor(data.length / 4);
-        if (words === 0) {
-            return { note: 'could not read stack memory' };
-        }
-        let firstNonFill = -1;
-        let fillCount = 0;
-        for (let i = 0; i < words; i++) {
-            if (data.readUInt32LE(i * 4) === TX_STACK_FILL) {
-                fillCount++;
-            } else if (firstNonFill < 0) {
-                firstNonFill = i;
-            }
-        }
-        if (fillCount === 0) {
-            return { note: 'no 0xEFEFEFEF fill found — stack filling disabled (TX_DISABLE_STACK_FILLING) or stack fully consumed; high-water unavailable' };
-        }
-        if (firstNonFill < 0) {
-            firstNonFill = words; // entire stack still filled (never used)
-        }
-        const freeBytes = firstNonFill * 4;
-        const peakUsedBytes = size - freeBytes;
-        const peakPct = Math.round((peakUsedBytes / size) * 1000) / 10;
-        return { peakUsedBytes, freeBytes, peakPct, overflowRisk: freeBytes <= 64 };
+        return scanStackHighWater(data, size);
     }
 
     /**
@@ -1675,13 +1480,7 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
 
         // Detect the core (CPUID PartNo bits[15:4]).
         const cpuid = await this.readU32(session, 0xE000ED00);
-        const partno = (cpuid >> 4) & 0xfff;
-        const core = CORTEX_CORES[partno] ?? {
-            name: `unknown core (CPUID PartNo 0x${partno.toString(16)})`,
-            // Architecture field bits[19:16]: 0xF = v7-M/v8-M (has CFSR), 0xC = v6-M.
-            configurableFaults: ((cpuid >> 16) & 0xf) === 0xf,
-            v8m: false,
-        };
+        const core = coreFromCpuid(cpuid);
 
         // Current exception (ICSR.VECTACTIVE bits[8:0]).
         const icsr = await this.readU32(session, 0xE000ED04);
@@ -1692,68 +1491,24 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             ?? (vectActive === 0 ? 'Thread mode' : `exception ${vectActive}`);
         const inFaultHandler = vectActive >= 3 && vectActive <= 7;
 
-        const flags: string[] = [];
-        const add = (cond: number, name: string) => { if (cond) { flags.push(name); } };
-
-        // Configurable-fault status block (v7-M / v8-M Mainline only).
-        let cfsr = 0, hfsr = 0, dfsr = 0, shcsr = 0;
-        let mmarValid = false, bfarValid = false;
-        let mmfar: number | undefined, bfar: number | undefined;
+        // Configurable-fault status block (v7-M / v8-M Mainline only); SecureFault
+        // status on ARMv8-M with Security (SFSR reads as 0 from a Non-secure
+        // context / without the Main Extension). The bit decode itself is pure —
+        // see decodeFaultFlags in cortex-decode.ts.
+        let cfsr = 0, hfsr = 0, dfsr = 0, shcsr = 0, sfsr = 0;
         if (core.configurableFaults) {
             cfsr = await this.readU32(session, 0xE000ED28);
             hfsr = await this.readU32(session, 0xE000ED2C);
             dfsr = await this.readU32(session, 0xE000ED30);
             shcsr = await this.readU32(session, 0xE000ED24);
-            const mmfsr = cfsr & 0xff;
-            const bfsr = (cfsr >> 8) & 0xff;
-            const ufsr = (cfsr >> 16) & 0xffff;
-            add(mmfsr & 0x01, 'MMFSR.IACCVIOL (instruction access violation)');
-            add(mmfsr & 0x02, 'MMFSR.DACCVIOL (data access violation)');
-            add(mmfsr & 0x08, 'MMFSR.MUNSTKERR (MemManage unstacking on exception return)');
-            add(mmfsr & 0x10, 'MMFSR.MSTKERR (MemManage stacking on exception entry)');
-            add(mmfsr & 0x20, 'MMFSR.MLSPERR (MemManage during lazy FP state save)');
-            add(bfsr & 0x01, 'BFSR.IBUSERR (instruction bus error)');
-            add(bfsr & 0x02, 'BFSR.PRECISERR (precise data bus error)');
-            add(bfsr & 0x04, 'BFSR.IMPRECISERR (imprecise data bus error)');
-            add(bfsr & 0x08, 'BFSR.UNSTKERR (bus fault on unstacking)');
-            add(bfsr & 0x10, 'BFSR.STKERR (bus fault on stacking)');
-            add(bfsr & 0x20, 'BFSR.LSPERR (bus fault during lazy FP state save)');
-            add(ufsr & 0x0001, 'UFSR.UNDEFINSTR (undefined instruction)');
-            add(ufsr & 0x0002, 'UFSR.INVSTATE (invalid EPSR/Thumb state)');
-            add(ufsr & 0x0004, 'UFSR.INVPC (invalid PC load via EXC_RETURN)');
-            add(ufsr & 0x0008, 'UFSR.NOCP (no coprocessor / FPU not enabled)');
-            if (core.v8m) {
-                add(ufsr & 0x0010, 'UFSR.STKOF (stack overflow — ARMv8-M; check MSPLIM/PSPLIM)');
-            }
-            add(ufsr & 0x0100, 'UFSR.UNALIGNED (unaligned access)');
-            add(ufsr & 0x0200, 'UFSR.DIVBYZERO (divide by zero)');
-            add(hfsr & 0x00000002, 'HFSR.VECTTBL (vector table read fault)');
-            add(hfsr & 0x40000000, 'HFSR.FORCED (escalated configurable fault — see CFSR bits)');
-            add(hfsr & 0x80000000, 'HFSR.DEBUGEVT (debug event)');
-            mmarValid = !!(mmfsr & 0x80);
-            bfarValid = !!(bfsr & 0x80);
-            mmfar = mmarValid ? await this.readU32(session, 0xE000ED34) : undefined;
-            bfar = bfarValid ? await this.readU32(session, 0xE000ED38) : undefined;
         }
-
-        // SecureFault (ARMv8-M with the Security Extension). SFSR reads as 0 from a
-        // Non-secure context / without the Main Extension, so only decode if set.
-        let sfsr = 0, sfarValid = false;
-        let sfar: number | undefined;
         if (core.v8m) {
             sfsr = await this.readU32(session, 0xE000EDE4).catch(() => 0);
-            if (sfsr) {
-                add(sfsr & 0x01, 'SFSR.INVEP (invalid entry point)');
-                add(sfsr & 0x02, 'SFSR.INVIS (invalid integrity signature)');
-                add(sfsr & 0x04, 'SFSR.INVER (invalid exception return)');
-                add(sfsr & 0x08, 'SFSR.AUVIOL (attribution unit violation)');
-                add(sfsr & 0x10, 'SFSR.INVTRAN (invalid transition)');
-                add(sfsr & 0x20, 'SFSR.LSPERR (lazy FP preservation error)');
-                add(sfsr & 0x80, 'SFSR.LSERR (lazy state error)');
-                sfarValid = !!(sfsr & 0x40);
-                sfar = sfarValid ? await this.readU32(session, 0xE000EDE8).catch(() => undefined) : undefined;
-            }
         }
+        const { flags, mmarValid, bfarValid, sfarValid } = decodeFaultFlags(core, cfsr, hfsr, sfsr);
+        const mmfar = mmarValid ? await this.readU32(session, 0xE000ED34) : undefined;
+        const bfar = bfarValid ? await this.readU32(session, 0xE000ED38) : undefined;
+        const sfar = sfarValid ? await this.readU32(session, 0xE000EDE8).catch(() => undefined) : undefined;
 
         const faultActive = inFaultHandler || cfsr !== 0 || hfsr !== 0 || sfsr !== 0;
         if (!faultActive) {
@@ -1830,13 +1585,12 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             }
             const regs = await this.readRegisterMap(session, topFrameId);
             const lr = regs['lr'];
-            if (lr === undefined || (lr >>> 24) !== 0xff) {
+            const exc = lr !== undefined ? decodeExcReturn(lr, v8m) : undefined;
+            if (lr === undefined || !exc) {
                 ctx.note = '$lr is not an EXC_RETURN — not stopped in the fault handler? Pre-fault context unavailable.';
                 return ctx;
             }
-            const useProcessStack = !!(lr & 0x4);  // EXC_RETURN bit 2 (SPSEL)
-            const basicFrame = !!(lr & 0x10);      // bit 4 (FType): 1 = basic (no FP), 0 = extended
-            const secure = v8m && !!(lr & 0x40);   // bit 6 (S): frame on the Secure stack
+            const { useProcessStack, basicFrame, secure } = exc;
             let sp: number | undefined;
             if (secure) {
                 sp = useProcessStack ? (regs['psp_s'] ?? regs['psp']) : (regs['msp_s'] ?? regs['msp']);
@@ -1852,19 +1606,20 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
             }
             const resp = await session.customRequest('readMemory', { memoryReference: hex32(sp), offset: 0, count: 32 });
             const f = resp?.data ? Buffer.from(resp.data, 'base64') : Buffer.alloc(0);
-            if (f.length < 32) {
+            const frame = decodeStackedFrame(f);
+            if (!frame) {
                 ctx.note = 'Could not read the stacked exception frame.';
                 return ctx;
             }
-            const stackedPc = f.readUInt32LE(24);
-            ctx.r0 = hex32(f.readUInt32LE(0));
-            ctx.r1 = hex32(f.readUInt32LE(4));
-            ctx.r2 = hex32(f.readUInt32LE(8));
-            ctx.r3 = hex32(f.readUInt32LE(12));
-            ctx.r12 = hex32(f.readUInt32LE(16));
-            ctx.faultingLr = hex32(f.readUInt32LE(20));
-            ctx.faultingPc = hex32(stackedPc);
-            ctx.xpsr = hex32(f.readUInt32LE(28));
+            const stackedPc = frame.pc;
+            ctx.r0 = hex32(frame.r0);
+            ctx.r1 = hex32(frame.r1);
+            ctx.r2 = hex32(frame.r2);
+            ctx.r3 = hex32(frame.r3);
+            ctx.r12 = hex32(frame.r12);
+            ctx.faultingLr = hex32(frame.lr);
+            ctx.faultingPc = hex32(frame.pc);
+            ctx.xpsr = hex32(frame.xpsr);
             try {
                 const info = await this.handleGdbExec({ command: `info line *${hex32(stackedPc)}` });
                 ctx.sourceLine = info.split('\n')[0];
@@ -2145,157 +1900,177 @@ export class DebugServer extends EventEmitter implements DebugServerEvents {
         const results: string[] = [];
 
         for (const step of payload.steps) {
-            switch (step.type) {
-                case 'setBreakpoint': {
-                    if (!step.line) {
-                        throw new Error('Line number required');
-                    }
-                    if (!step.file) {
-                        throw new Error('File path required');
-                    }
-
-                    // Open the file and make it active
-                    const document = await vscode.workspace.openTextDocument(step.file);
-                    const editor = await vscode.window.showTextDocument(document);
-
-                    const bp = new vscode.SourceBreakpoint(
-                        new vscode.Location(
-                            editor.document.uri,
-                            new vscode.Position(step.line - 1, 0)
-                        ),
-                        true,
-                        step.condition,
-                    );
-                    this.tracker.markSelfBreakpoints([bp]);
-                    await vscode.debug.addBreakpoints([bp]);
-                    results.push(`Set breakpoint at line ${step.line}`);
-                    break;
-                }
-
-                case 'removeBreakpoint': {
-                    if (!step.line) {
-                        throw new Error('Line number required');
-                    }
-                    const bps = vscode.debug.breakpoints.filter(bp => {
-                        if (bp instanceof vscode.SourceBreakpoint) {
-                            return bp.location.range.start.line === step.line! - 1;
-                        }
-                        return false;
-                    });
-                    this.tracker.markSelfBreakpoints(bps);
-                    await vscode.debug.removeBreakpoints(bps);
-                    results.push(`Removed breakpoint at line ${step.line}`);
-                    break;
-                }
-
-                case 'continue': {
-                    const session = vscode.debug.activeDebugSession;
-                    if (!session) {
-                        throw new Error('No active debug session');
-                    }
-
-                    // Continue the thread that is actually stopped (resolved from the
-                    // `stopped` event), not threads[0]. On an all-stop Cortex-M target
-                    // this resumes the core; allThreadsContinued typically comes back true.
-                    const threadId = await this.tracker.resolveActiveThreadId(session);
-                    if (threadId === undefined) {
-                        throw new Error('No threads available to continue');
-                    }
-
-                    this.tracker.markSelfActivity();
-                    await session.customRequest('continue', { threadId });
-                    results.push('Continued execution');
-                    break;
-                }
-
-                case 'stepOver': {
-                    results.push(await this.runFlowCommand('workbench.action.debug.stepOver', 'Stepped over'));
-                    break;
-                }
-
-                case 'stepInto': {
-                    results.push(await this.runFlowCommand('workbench.action.debug.stepInto', 'Stepped into'));
-                    break;
-                }
-
-                case 'stepOut': {
-                    results.push(await this.runFlowCommand('workbench.action.debug.stepOut', 'Stepped out'));
-                    break;
-                }
-
-                case 'pause': {
-                    // Pausing an already-stopped target is a no-op that emits no
-                    // `stopped` event — short-circuit so we don't wait for a stop
-                    // that never comes.
-                    const session = vscode.debug.activeDebugSession;
-                    if (session && this.tracker.getState(session.id)?.isStopped) {
-                        results.push('Already paused');
-                        break;
-                    }
-                    results.push(await this.runFlowCommand('workbench.action.debug.pause', 'Paused'));
-                    break;
-                }
-
-                case 'evaluate': {
-                    // Resolve the correct stopped thread + frame from session state.
-                    // This replaces the old hardcoded `threadId: 1`, which broke under
-                    // multi-thread (RTOS) targets where the stopped thread is rarely id 1.
-                    let session: vscode.DebugSession;
-                    let frameId: number;
-                    try {
-                        ({ session, frameId } = await this.tracker.resolveActiveFrame());
-                    } catch (err: any) {
-                        results.push(`ERROR: Could not resolve a stopped frame for "${step.expression}": ${err instanceof Error ? err.message : String(err)}`);
-                        break;
-                    }
-
-                    try {
-                        // Use 'watch' context, NOT 'repl'. cortex-debug's repl path runs
-                        // the input as `interpreter-exec console`, emits the value to the
-                        // Debug Console as an OutputEvent, and returns a valueless serialized
-                        // node in response.result (the "relay bug") — and it ignores frameId.
-                        // The 'watch' path evaluates the expression via a var-object, returns
-                        // the value in response.result, and honors frameId (frame-pinned to
-                        // the resolved RTOS thread/frame). It is also the portable DAP context
-                        // (debugpy etc.). Trade-off: GDB CLI verbs ('p/x', 'info registers',
-                        // 'x/...', 'monitor ...') are NOT valid here — those move to the
-                        // Phase 4 gdb_exec tool (repl + OutputEvent capture). Use bare
-                        // expressions; for hex, append a ',x' format suffix.
-                        const response = await session.customRequest('evaluate', {
-                            expression: step.expression,
-                            frameId: frameId,
-                            context: 'watch'
-                        });
-
-                        results.push(`Evaluated "${step.expression}": ${response.result}`);
-                    } catch (err: any) {
-                        let errorMessage = '';
-                        let stackTrace = '';
-
-                        if (err instanceof Error) {
-                            errorMessage = err.message;
-                            if (err.stack) {
-                                stackTrace = `\nStack: ${err.stack}`;
-                            }
-                        } else {
-                            errorMessage = String(err);
-                        }
-                        results.push(`ERROR: Evaluation failed for "${step.expression}": ${errorMessage}${stackTrace}`);
-                    }
-                    break;
-                }
-
-                case 'launch': {
-                    if (!step.file) {
-                        throw new Error('File path required for launch');
-                    }
-                    await this.handleLaunch({ program: step.file });
-                    break;
-                }
+            // A failing step must not throw the whole plan away: earlier steps
+            // already acted on the live target, so report them plus the error
+            // and skip the rest (blindly continuing after a failure is unsafe).
+            try {
+                await this.executeDebugStep(step, results);
+            } catch (err) {
+                results.push(`ERROR in step '${step.type}': ${err instanceof Error ? err.message : String(err)} — remaining steps skipped`);
+                break;
             }
         }
 
         return results;
+    }
+
+    private async executeDebugStep(step: DebugStep, results: string[]): Promise<void> {
+        switch (step.type) {
+            case 'setBreakpoint': {
+                if (!step.line) {
+                    throw new Error('Line number required');
+                }
+                if (!step.file) {
+                    throw new Error('File path required');
+                }
+
+                // Open the file and make it active
+                const document = await vscode.workspace.openTextDocument(step.file);
+                const editor = await vscode.window.showTextDocument(document);
+
+                const bp = new vscode.SourceBreakpoint(
+                    new vscode.Location(
+                        editor.document.uri,
+                        new vscode.Position(step.line - 1, 0)
+                    ),
+                    true,
+                    step.condition,
+                );
+                this.tracker.markSelfBreakpoints([bp]);
+                await vscode.debug.addBreakpoints([bp]);
+                results.push(`Set breakpoint at line ${step.line}`);
+                break;
+            }
+
+            case 'removeBreakpoint': {
+                if (!step.line) {
+                    throw new Error('Line number required');
+                }
+                const bps = vscode.debug.breakpoints.filter(bp => {
+                    if (!(bp instanceof vscode.SourceBreakpoint)) {
+                        return false;
+                    }
+                    if (bp.location.range.start.line !== step.line! - 1) {
+                        return false;
+                    }
+                    // Only match the requested file (when given): a bare line
+                    // number would otherwise also remove the human's
+                    // breakpoints on that line in OTHER files.
+                    return !step.file || bp.location.uri.fsPath === step.file;
+                });
+                this.tracker.markSelfBreakpoints(bps);
+                await vscode.debug.removeBreakpoints(bps);
+                results.push(bps.length > 0
+                    ? `Removed ${bps.length} breakpoint(s) at line ${step.line}`
+                    : `No breakpoint found at ${step.file ?? '(any file)'}:${step.line}`);
+                break;
+            }
+
+            case 'continue': {
+                const session = vscode.debug.activeDebugSession;
+                if (!session) {
+                    throw new Error('No active debug session');
+                }
+
+                // Continue the thread that is actually stopped (resolved from the
+                // `stopped` event), not threads[0]. On an all-stop Cortex-M target
+                // this resumes the core; allThreadsContinued typically comes back true.
+                const threadId = await this.tracker.resolveActiveThreadId(session);
+                if (threadId === undefined) {
+                    throw new Error('No threads available to continue');
+                }
+
+                this.tracker.markSelfActivity();
+                await session.customRequest('continue', { threadId });
+                results.push('Continued execution');
+                break;
+            }
+
+            case 'stepOver': {
+                results.push(await this.runFlowCommand('workbench.action.debug.stepOver', 'Stepped over'));
+                break;
+            }
+
+            case 'stepInto': {
+                results.push(await this.runFlowCommand('workbench.action.debug.stepInto', 'Stepped into'));
+                break;
+            }
+
+            case 'stepOut': {
+                results.push(await this.runFlowCommand('workbench.action.debug.stepOut', 'Stepped out'));
+                break;
+            }
+
+            case 'pause': {
+                // Pausing an already-stopped target is a no-op that emits no
+                // `stopped` event — short-circuit so we don't wait for a stop
+                // that never comes.
+                const session = vscode.debug.activeDebugSession;
+                if (session && this.tracker.getState(session.id)?.isStopped) {
+                    results.push('Already paused');
+                    break;
+                }
+                results.push(await this.runFlowCommand('workbench.action.debug.pause', 'Paused'));
+                break;
+            }
+
+            case 'evaluate': {
+                // Resolve the correct stopped thread + frame from session state.
+                // This replaces the old hardcoded `threadId: 1`, which broke under
+                // multi-thread (RTOS) targets where the stopped thread is rarely id 1.
+                let session: vscode.DebugSession;
+                let frameId: number;
+                try {
+                    ({ session, frameId } = await this.tracker.resolveActiveFrame());
+                } catch (err: any) {
+                    results.push(`ERROR: Could not resolve a stopped frame for "${step.expression}": ${err instanceof Error ? err.message : String(err)}`);
+                    break;
+                }
+
+                try {
+                    // Use 'watch' context, NOT 'repl'. cortex-debug's repl path runs
+                    // the input as `interpreter-exec console`, emits the value to the
+                    // Debug Console as an OutputEvent, and returns a valueless serialized
+                    // node in response.result (the "relay bug") — and it ignores frameId.
+                    // The 'watch' path evaluates the expression via a var-object, returns
+                    // the value in response.result, and honors frameId (frame-pinned to
+                    // the resolved RTOS thread/frame). It is also the portable DAP context
+                    // (debugpy etc.). Trade-off: GDB CLI verbs ('p/x', 'info registers',
+                    // 'x/...', 'monitor ...') are NOT valid here — those move to the
+                    // Phase 4 gdb_exec tool (repl + OutputEvent capture). Use bare
+                    // expressions; for hex, append a ',x' format suffix.
+                    const response = await session.customRequest('evaluate', {
+                        expression: step.expression,
+                        frameId: frameId,
+                        context: 'watch'
+                    });
+
+                    results.push(`Evaluated "${step.expression}": ${response.result}`);
+                } catch (err: any) {
+                    let errorMessage = '';
+                    let stackTrace = '';
+
+                    if (err instanceof Error) {
+                        errorMessage = err.message;
+                        if (err.stack) {
+                            stackTrace = `\nStack: ${err.stack}`;
+                        }
+                    } else {
+                        errorMessage = String(err);
+                    }
+                    results.push(`ERROR: Evaluation failed for "${step.expression}": ${errorMessage}${stackTrace}`);
+                }
+                break;
+            }
+
+            case 'launch': {
+                if (!step.file) {
+                    throw new Error('File path required for launch');
+                }
+                await this.handleLaunch({ program: step.file });
+                break;
+            }
+        }
     }
 
     stop(): Promise<void> {
