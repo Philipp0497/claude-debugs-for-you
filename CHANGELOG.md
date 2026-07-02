@@ -4,6 +4,24 @@ All notable changes to the "claude-debugs-for-you" extension will be documented 
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## 0.2.0 (Cortex/ThreadX fork)
+
+First versioned release of the [Cortex/ThreadX fork](https://github.com/Philipp0497/claude-debugs-for-you):
+a shared single-session pair-debugger for cortex-debug with 20 tools (session lifecycle, Cortex-M
+forensics incl. `explain_fault`, ThreadX `inspect_tcb`/`thread_stack_usage`, SVD `read_peripheral`,
+`gdb_exec`, hardware watchpoints) over three transports including streamable-HTTP `/mcp`.
+
+- **SECURITY**: the HTTP server now binds to `127.0.0.1` only, rejects non-local `Host`/`Origin`
+  headers (DNS rebinding / browser drive-by protection), and no longer sends wildcard CORS.
+- Single tool registry: MCP registration, `/tcp` dispatch, and `listTools` all derive from one table;
+  the stdio proxy now fetches the tool list from the extension instead of keeping a drifting copy.
+- Fixed `removeBreakpoint` also removing same-line breakpoints in *other* files; `debug` plans now
+  return the results of already-executed steps when a later step fails, instead of discarding them.
+- stdio proxy: `CLAUDE_DEBUGS_PORT` env override; finds the extension's globalStorage under
+  Code, Code - Insiders, VSCodium, and Code - OSS.
+- Pure Cortex-M/ThreadX decode logic extracted to `src/cortex-decode.ts` with unit tests
+  (`npm run test:unit`) and a CI workflow.
+
 ## 0.1.2
 
 - Report exceptions to LLM

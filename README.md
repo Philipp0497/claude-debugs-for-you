@@ -155,6 +155,11 @@ npx @vscode/vsce package
 
 ## Notes & caveats
 
+- **Local-only server**: the HTTP server binds to `127.0.0.1` and rejects requests with a non-local
+  `Host`/`Origin` header (DNS-rebinding / browser drive-by protection). These tools can flash/halt
+  hardware and read workspace files — do not re-expose the port on a network interface.
+- **Port override**: the stdio proxy honors `CLAUDE_DEBUGS_PORT`, and finds the extension's
+  globalStorage under VS Code, Insiders, VSCodium, and Code - OSS.
 - **Generic targets**: the session/flow/inspection tools are debugger-agnostic; the forensics, ThreadX,
   and peripheral tools are Cortex-M / ThreadX specific and degrade with a clear note elsewhere.
 - **`runToEntryPoint:"main"`**: with this set, cortex-debug auto-drives reset→main; the tools account for
